@@ -86,22 +86,11 @@ export default function TeleopPage() {
   const [estop, setEstop] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [controlMode, setControlMode] = useState("joystick"); 
-    // ---- Human Follow Toggle ----
-  const [humanFollowEnabled, setHumanFollowEnabled] = useState(false);
-  const [humanFollowBusy, setHumanFollowBusy] = useState(false);
-  const [humanFollowMsg, setHumanFollowMsg] = useState("");
-  const [pid, setPid] = useState({ kp: 0.6, ki: 0.0, kd: 0.05, i_clamp: 1.0, out_clamp: 1.2 });
-  const [pidBusy, setPidBusy] = useState(false);
-  const [pidMsg, setPidMsg] = useState("");
-
 
 
   const rosRef = useRef(null);
   const cmdVelTopicRef = useRef(null);
   const emergencyTopicRef = useRef(null);
-  const humanFollowSrvRef = useRef(null);
-  const setPidSrvRef = useRef(null);
-
 
 
   const joystickZoneRef = useRef(null);
@@ -154,7 +143,6 @@ export default function TeleopPage() {
       }
       cmdVelTopicRef.current = null;
       emergencyTopicRef.current = null;
-      humanFollowSrvRef.current = null;
 
       
       if (rosRef.current) {
@@ -179,18 +167,6 @@ const connect = () => {
   ros.on("connection", () => {
     setIsConnected(true);
     setStatusText("Bağlandı");
-    
-    humanFollowSrvRef.current = new ROSLIB.Service({
-      ros,
-      name: "/human_follow/enable",
-      serviceType: "std_srvs/SetBool",
-    });
-    setPidSrvRef.current = new ROSLIB.Service({
-      ros,
-      name: "/human_follow/set_pid",
-      serviceType: "atoh2_human_msgs/SetPid",
-    });
-
 
     cmdVelTopicRef.current = new ROSLIB.Topic({
       ros,
@@ -308,75 +284,6 @@ const connect = () => {
   };
 
 
-
-  const callSetPid = (nextPid) => {
-  const srv = setPidSrvRef.current;
-  if (!srv || !isConnected) {
-    setPidMsg("ROS bağlı değil ya da PID servisi hazır değil.");
-    return;
-  }
-
-  setPidBusy(true);
-  setPidMsg("");
-
-  const req = new ROSLIB.ServiceRequest({
-    kp: Number(nextPid.kp),
-    ki: Number(nextPid.ki),
-    kd: Number(nextPid.kd),
-    i_clamp: Number(nextPid.i_clamp),
-    out_clamp: Number(nextPid.out_clamp),
-  });
-
-  srv.callService(
-    req,
-    (res) => {
-      setPid(nextPid);
-      setPidMsg(res?.message || "PID updated.");
-      setPidBusy(false);
-    },
-    (err) => {
-      setPidMsg(`PID servis hatası: ${prettyErr(err)}`);
-      setPidBusy(false);
-    }
-  );
-};
-
-
-
-
-
-
-    const callHumanFollow = (enable) => {
-    const srv = humanFollowSrvRef.current;
-    if (!srv || !isConnected) {
-      setHumanFollowMsg("ROS bağlı değil ya da servis hazır değil.");
-      return;
-    }
-    
-
-
-
-
-    setHumanFollowBusy(true);
-    setHumanFollowMsg("");
-
-    const req = new ROSLIB.ServiceRequest({ data: !!enable });
-
-    srv.callService(
-      req,
-      (res) => {
-        setHumanFollowEnabled(!!enable);
-        setHumanFollowMsg(res?.message || (enable ? "Started." : "Stopped."));
-        setHumanFollowBusy(false);
-      },
-      (err) => {
-        setHumanFollowMsg(`Servis hatası: ${prettyErr(err)}`);
-        setHumanFollowBusy(false);
-      }
-    );
-  };
-
-
   useEffect(() => {
     if (!isConnected || !rosRef.current) {
       cleanupTelemetry();
@@ -419,7 +326,7 @@ const connect = () => {
 
         subs[key] = t;
       } catch (e) {
-        setTelemetryErr((prev) => prev || `${key} sub hata: ${prettyErr(e)}`);
+        setTelemetryErr((prev) => prev || `${key} sub hatası: ${prettyErr(e)}`);
       }
     };
 
@@ -513,7 +420,7 @@ const connect = () => {
                 </div>
               </div>
 
-              {/* ====== BURADA: HUMAN FOLLOW BUTONU ====== */}
+              {/* Connect/Disconnect Buttons */}
               <div style={{ display: 'flex', gap: '0.375rem', alignItems: 'center', flexWrap: 'wrap' }}>
                 {!isConnected && (
                   <button
@@ -529,63 +436,28 @@ const connect = () => {
                       fontSize: '0.75rem'
                     }}
                   >
-                    🔌 Bağlan
+                    📡 Bağlan
                   </button>
                 )}
                 {isConnected && (
-                  <>
-                    <button
-                      onClick={() => { disconnect(); safeStop(); }}
-                      style={{
-                        padding: '0.375rem 0.75rem',
-                        background: '#475569',
-                        border: 'none',
-                        borderRadius: '0.375rem',
-                        color: 'white',
-                        fontWeight: '600',
-                        cursor: 'pointer',
-                        fontSize: '0.75rem'
-                      }}
-                    >
-                      ⛔ Kes
-                    </button>
-                    {/* HUMAN FOLLOW BUTONU - Sadece bağlıyken görünür */}
-                    <button
-                      disabled={humanFollowBusy}
-                      onClick={() => callHumanFollow(!humanFollowEnabled)}
-                      style={{
-                        padding: '0.375rem 0.75rem',
-                        background: humanFollowEnabled ? '#16a34a' : '#334155',
-                        border: 'none',
-                        borderRadius: '0.375rem',
-                        color: 'white',
-                        fontWeight: '800',
-                        cursor: humanFollowBusy ? 'not-allowed' : 'pointer',
-                        fontSize: '0.75rem',
-                        opacity: humanFollowBusy ? 0.6 : 1
-                      }}
-                      title="/human_follow/enable"
-                    >
-                      🧍 Human Follow: {humanFollowEnabled ? "ON" : "OFF"}
-                    </button>
-                  </>
+                  <button
+                    onClick={() => { disconnect(); safeStop(); }}
+                    style={{
+                      padding: '0.375rem 0.75rem',
+                      background: '#475569',
+                      border: 'none',
+                      borderRadius: '0.375rem',
+                      color: 'white',
+                      fontWeight: '600',
+                      cursor: 'pointer',
+                      fontSize: '0.75rem'
+                    }}
+                  >
+                    🔌 Kes
+                  </button>
                 )}
               </div>
             </div>
-            {/* Human Follow Mesajı */}
-            {humanFollowMsg && (
-              <div style={{ 
-                marginTop: '0.5rem', 
-                padding: '0.375rem 0.5rem', 
-                background: 'rgba(59, 130, 246, 0.1)', 
-                border: '1px solid #3b82f6', 
-                borderRadius: '0.375rem', 
-                fontSize: '0.75rem',
-                color: '#93c5fd'
-              }}>
-                ℹ️ {humanFollowMsg}
-              </div>
-            )}
           </div>
         </div>
 
@@ -845,11 +717,6 @@ const connect = () => {
                     fontSize: '0.75rem'
                   }}
                 >
-
-                 
-
-
-
                   🕹️ Joystick
                 </button>
                 <button
@@ -869,114 +736,27 @@ const connect = () => {
                     fontSize: '0.75rem'
                   }}
                 >
-                  🔲 Butonlar
+                  🔘 Butonlar
                 </button>
               </div>
             </div>
 
-           {/* cmd_vel Veri Açıklaması + PID (yan yana) */}
-<div
-  style={{
-    marginTop: "0.75rem",
-    display: "grid",
-    gridTemplateColumns: window.innerWidth < 900 ? "1fr" : "1.3fr 1fr",
-    gap: "0.75rem",
-  }}
->
-  {/* SOL: cmd_vel Veri Formatı */}
-  <div
-    style={{
-      padding: "0.75rem",
-      background: "#0f172a",
-      borderRadius: "0.375rem",
-      border: "1px solid #334155",
-    }}
-  >
-    <div style={{ fontSize: "0.75rem", color: "#cbd5e1" }}>
-      <div style={{ fontWeight: "600", marginBottom: "0.375rem" }}>
-        📡 cmd_vel Veri Formatı
-      </div>
-      <div style={{ fontFamily: "monospace", fontSize: "0.625rem", color: "#60a5fa" }}>
-        <div>⬆️ İleri tam: linear.x = +{linearMax} m/s</div>
-        <div>⬇️ Geri tam: linear.x = -{linearMax} m/s</div>
-        <div>↪️ Sola tam: angular.z = +{angularMax} rad/s</div>
-        <div>↩️ Sağa tam: angular.z = -{angularMax} rad/s</div>
-      </div>
-    </div>
-  </div>
-
-  {/* SAĞ: PID Panel */}
-  <div
-    style={{
-      padding: "0.75rem",
-      background: "#0f172a",
-      borderRadius: "0.375rem",
-      border: "1px solid #334155",
-    }}
-  >
-    <div style={{ fontWeight: "700", marginBottom: "0.5rem", fontSize: "0.875rem" }}>
-      🎯 Human Follow PID
-    </div>
-
-    <div
-      style={{
-        display: "grid",
-        gridTemplateColumns: window.innerWidth < 900 ? "repeat(2, 1fr)" : "repeat(5, 1fr)",
-        gap: "0.5rem",
-      }}
-    >
-      {["kp", "ki", "kd", "i_clamp", "out_clamp"].map((k) => (
-        <div key={k}>
-          <div style={{ fontSize: "0.75rem", marginBottom: "0.25rem", color: "#cbd5e1" }}>{k}</div>
-          <input
-            type="number"
-            step="0.01"
-            value={pid[k]}
-            onChange={(e) => setPid((p) => ({ ...p, [k]: Number(e.target.value) }))}
-            style={{
-              width: "100%",
-              padding: "0.5rem",
-              background: "#334155",
-              border: "1px solid #475569",
-              borderRadius: "0.375rem",
-              color: "white",
-              outline: "none",
-              fontSize: "0.8125rem",
-            }}
-          />
-        </div>
-      ))}
-    </div>
-
-    <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.75rem", alignItems: "center", flexWrap: "wrap" }}>
-      <button
-        disabled={!isConnected || pidBusy}
-        onClick={() => callSetPid(pid)}
-        style={{
-          padding: "0.5rem 0.75rem",
-          background: !isConnected || pidBusy ? "#475569" : "#2563eb",
-          border: "none",
-          borderRadius: "0.375rem",
-          color: "white",
-          fontWeight: "800",
-          cursor: !isConnected || pidBusy ? "not-allowed" : "pointer",
-          fontSize: "0.75rem",
-          opacity: !isConnected || pidBusy ? 0.6 : 1,
-        }}
-      >
-        ✅ PID Uygula
-      </button>
-
-      {pidMsg && <div style={{ fontSize: "0.75rem", color: "#cbd5e1" }}>{pidMsg}</div>}
-    </div>
-  </div>
-</div>
+            {/* Joystick Veri Açıklaması */}
+            <div style={{ marginTop: '0.75rem', padding: '0.75rem', background: '#0f172a', borderRadius: '0.375rem', border: '1px solid #334155' }}>
+              <div style={{ fontSize: '0.75rem', color: '#cbd5e1' }}>
+                <div style={{ fontWeight: '600', marginBottom: '0.375rem' }}>📋 cmd_vel Veri Formatı</div>
+                <div style={{ fontFamily: 'monospace', fontSize: '0.625rem', color: '#60a5fa' }}>
+                  <div>⬆️ İleri tam: linear.x = +{linearMax} m/s</div>
+                  <div>⬇️ Geri tam: linear.x = -{linearMax} m/s</div>
+                  <div>⬅️ Sola tam: angular.z = +{angularMax} rad/s</div>
+                  <div>➡️ Sağa tam: angular.z = -{angularMax} rad/s</div>
+                </div>
+              </div>
+            </div>
           </div>
         )}
 
-
-
-        {/* Main Control Grid - FLEXİBLE */}
+        {/* Main Control Grid - FLEKSİBLE */}
         <div style={{ 
           flex: 1, 
           display: 'grid', 
@@ -1018,7 +798,7 @@ const connect = () => {
                   textAlign: 'center'
                 }}>
                   <div>
-                    <div style={{ fontSize: '2.5rem', marginBottom: '0.25rem' }}>🎯</div>
+                    <div style={{ fontSize: '2.5rem', marginBottom: '0.25rem' }}>👆</div>
                     <div style={{ fontSize: '0.75rem' }}>İleri/Geri + Sağ/Sol</div>
                     <div style={{ fontSize: '0.625rem', marginTop: '0.25rem', color: '#475569' }}>Bırakınca durur</div>
                   </div>
@@ -1031,7 +811,7 @@ const connect = () => {
           {controlMode === "buttons" && (
             <div style={{ background: '#1e293b', borderRadius: '0.5rem', padding: '1rem', border: '1px solid #334155', display: 'flex', flexDirection: 'column' }}>
               <h2 style={{ fontSize: '1rem', fontWeight: 'bold', marginBottom: '0.75rem', marginTop: 0, flexShrink: 0 }}>
-                🔲 Buton Kontrol
+                🔘 Buton Kontrol
               </h2>
               
               <div style={{ 
@@ -1138,7 +918,7 @@ const connect = () => {
                     justifyContent: 'center'
                   }}
                 >
-                  ⏹️
+                  ⛔
                   <span style={{ fontSize: window.innerWidth < 768 ? '0.625rem' : '0.75rem', marginTop: '0.25rem' }}>DUR</span>
                 </button>
 
@@ -1220,7 +1000,7 @@ const connect = () => {
               </div>
 
               <div style={{ marginTop: '0.5rem', fontSize: '0.75rem', color: '#94a3b8', textAlign: 'center', flexShrink: 0 }}>
-                Basılı tut = Hareket • Bırak = Dur
+                Basılı tut = Hareket | Bırak = Dur
               </div>
             </div>
           )}
@@ -1228,7 +1008,7 @@ const connect = () => {
           {/* Control Panel - E-STOP */}
           <div style={{ background: '#1e293b', borderRadius: '0.5rem', padding: '1rem', border: '1px solid #334155', display: 'flex', flexDirection: 'column' }}>
             <h2 style={{ fontSize: '1rem', fontWeight: 'bold', marginBottom: '0.75rem', marginTop: 0, flexShrink: 0 }}>
-              🚨 Acil Durdurma
+              ⚠️ Acil Durdurma
             </h2>
             
             <div style={{ flex: 1, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem', alignItems: 'stretch' }}>
@@ -1279,8 +1059,8 @@ const connect = () => {
 
             {estop && (
               <div style={{ marginTop: '0.75rem', padding: '0.5rem', background: 'rgba(220, 38, 38, 0.2)', border: '1px solid #dc2626', borderRadius: '0.375rem', textAlign: 'center', flexShrink: 0 }}>
-                <div style={{ fontWeight: 'bold', color: '#f87171', fontSize: '0.75rem' }}>⚠️ ACİL DURDURMA AKTİF</div>
-                <div style={{ fontSize: '0.625rem', marginTop: '0.125rem' }}>Emergency topic: {emergencyTopic} → true</div>
+                <div style={{ fontWeight: 'bold', color: '#f87171', fontSize: '0.75rem' }}>🚨 ACİL DURDURMA AKTİF</div>
+                <div style={{ fontSize: '0.625rem', marginTop: '0.125rem' }}>Emergency topic: {emergencyTopic} = true</div>
               </div>
             )}
           </div>
@@ -1288,7 +1068,7 @@ const connect = () => {
 
         {/* Footer Info */}
         <div style={{ marginTop: '0.75rem', textAlign: 'center', fontSize: '0.625rem', color: '#64748b', flexShrink: 0 }}>
-          <div>Mobil ve masaüstü uyumlu • Real-time ROS kontrol</div>
+          <div>Mobil ve masaüstü uyumlu | Real-time ROS kontrol</div>
           <div style={{ marginTop: '0.125rem' }}>Topic: <code style={{ color: '#60a5fa' }}>{topicName}</code></div>
         </div>
       </div>

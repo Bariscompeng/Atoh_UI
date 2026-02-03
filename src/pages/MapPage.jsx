@@ -14,8 +14,7 @@ export default function MapPage() {
   const [robotPose, setRobotPose] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
   const [zoomLevel, setZoomLevel] = useState(1);
-  const [statusText, setStatusText] = useState("Bağlı değil");
-
+  const [statusText, setStatusText] = useState("Bağlantı yok");
 
   const wsRef = useRef(null);
   const canvasRef = useRef(null);
@@ -60,7 +59,7 @@ export default function MapPage() {
 
     ws.onopen = () => {
       setIsConnected(true);
-      setStatusText("Bağlandı");
+      setStatusText("Bağlantı sağlandı");
       
       // Subscribe to map
       mapSubIdRef.current = subscribe(mapTopic, "nav_msgs/OccupancyGrid");
@@ -113,27 +112,27 @@ export default function MapPage() {
       wsRef.current = null;
     }
     setIsConnected(false);
-    setStatusText("Bağlı değil");
+    setStatusText("Bağlantı yok");
   };
 
   useEffect(() => {
     if (!mapData || !viewportRef.current) return;
 
-  const recompute = () => {
-    const vw = viewportRef.current.clientWidth;
-    const vh = viewportRef.current.clientHeight;
-    const mw = mapData.info.width;
-    const mh = mapData.info.height;
+    const recompute = () => {
+      const vw = viewportRef.current.clientWidth;
+      const vh = viewportRef.current.clientHeight;
+      const mw = mapData.info.width;
+      const mh = mapData.info.height;
 
-    if (mw <= 0 || mh <= 0) return;
-    const s = Math.min(vw / mw, vh / mh);
-    setFitScale(s);
-  };
+      if (mw <= 0 || mh <= 0) return;
+      const s = Math.min(vw / mw, vh / mh);
+      setFitScale(s);
+    };
 
-  recompute();
-  window.addEventListener("resize", recompute);
-  return () => window.removeEventListener("resize", recompute);
-}, [mapData]);
+    recompute();
+    window.addEventListener("resize", recompute);
+    return () => window.removeEventListener("resize", recompute);
+  }, [mapData]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -142,107 +141,105 @@ export default function MapPage() {
 
   // Haritayı ve robotu çiz
   useEffect(() => {
-  if (!mapData || !canvasRef.current || !viewportRef.current) return;
+    if (!mapData || !canvasRef.current || !viewportRef.current) return;
 
-  const canvas = canvasRef.current;
-  const ctx = canvas.getContext("2d");
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext("2d");
 
-  const dpr = window.devicePixelRatio || 1;
+    const dpr = window.devicePixelRatio || 1;
 
-  const vw = viewportRef.current.clientWidth;   // viewport width (CSS px)
-  const vh = viewportRef.current.clientHeight;  // viewport height (CSS px)
+    const vw = viewportRef.current.clientWidth;   // viewport width (CSS px)
+    const vh = viewportRef.current.clientHeight;  // viewport height (CSS px)
 
-  // canvas gerçek piksel boyutu (retina için dpr ile)
-  canvas.width  = Math.max(1, Math.floor(vw * dpr));
-  canvas.height = Math.max(1, Math.floor(vh * dpr));
+    // canvas gerçek piksel boyutu (retina için dpr ile)
+    canvas.width  = Math.max(1, Math.floor(vw * dpr));
+    canvas.height = Math.max(1, Math.floor(vh * dpr));
 
-  // çizimde dpr düzelt
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, vw, vh);
-  ctx.imageSmoothingEnabled = false;
+    // çizimde dpr düzelt
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, vw, vh);
+    ctx.imageSmoothingEnabled = false;
 
-  const mw = mapData.info.width;
-  const mh = mapData.info.height;
-  const resolution = mapData.info.resolution;
-  const origin = mapData.info.origin;
-  const data = mapData.data;
+    const mw = mapData.info.width;
+    const mh = mapData.info.height;
+    const resolution = mapData.info.resolution;
+    const origin = mapData.info.origin;
+    const data = mapData.data;
 
-  // map'i viewport'a sığdır (zoomLevel ekstra çarpan)
-  const baseScale = Math.min(vw / mw, vh / mh);
-  const scale = baseScale * zoomLevel;
+    // map'i viewport'a sığdır (zoomLevel ekstra çarpan)
+    const baseScale = Math.min(vw / mw, vh / mh);
+    const scale = baseScale * zoomLevel;
 
-  // ortalamak için offset
-  const drawW = mw * scale;
-  const drawH = mh * scale;
-  const offsetX = (vw - drawW) / 2;
-  const offsetY = (vh - drawH) / 2;
+    // ortalamak için offset
+    const drawW = mw * scale;
+    const drawH = mh * scale;
+    const offsetX = (vw - drawW) / 2;
+    const offsetY = (vh - drawH) / 2;
 
-  // occupancy -> image (1 kez render)
-  const tempCanvas = document.createElement("canvas");
-  tempCanvas.width = mw;
-  tempCanvas.height = mh;
-  const tempCtx = tempCanvas.getContext("2d");
-  const imageData = tempCtx.createImageData(mw, mh);
+    // occupancy -> image (1 kez render)
+    const tempCanvas = document.createElement("canvas");
+    tempCanvas.width = mw;
+    tempCanvas.height = mh;
+    const tempCtx = tempCanvas.getContext("2d");
+    const imageData = tempCtx.createImageData(mw, mh);
 
-  for (let i = 0; i < data.length; i++) {
-    const v = data[i];
-    const c = v === -1 ? 128 : (v === 0 ? 255 : 0);
-    const idx = i * 4;
-    imageData.data[idx] = c;
-    imageData.data[idx + 1] = c;
-    imageData.data[idx + 2] = c;
-    imageData.data[idx + 3] = 255;
-  }
-  tempCtx.putImageData(imageData, 0, 0);
+    for (let i = 0; i < data.length; i++) {
+      const v = data[i];
+      const c = v === -1 ? 128 : (v === 0 ? 255 : 0);
+      const idx = i * 4;
+      imageData.data[idx] = c;
+      imageData.data[idx + 1] = c;
+      imageData.data[idx + 2] = c;
+      imageData.data[idx + 3] = 255;
+    }
+    tempCtx.putImageData(imageData, 0, 0);
 
-  // map çiz: transform = scale + offset
-  ctx.save();
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // reset
-  ctx.translate(offsetX, offsetY);
-  ctx.scale(scale, scale);
-  ctx.drawImage(tempCanvas, 0, 0);
-  ctx.restore();
-
-  // robot çiz (map koordinat -> canvas koordinat)
-  if (robotPose) {
-    const px = (robotPose.position.x - origin.position.x) / resolution;
-    const py = mh - (robotPose.position.y - origin.position.y) / resolution;
-
-    const cx = offsetX + px * scale;
-    const cy = offsetY + py * scale;
-
-    const q = robotPose.orientation;
-    const yaw = Math.atan2(
-      2.0 * (q.w * q.z + q.x * q.y),
-      1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-    );
-
+    // map çiz: transform = scale + offset
     ctx.save();
-    ctx.translate(cx, cy);
-
-    // gövde
-    ctx.beginPath();
-    ctx.arc(0, 0, 8, 0, Math.PI * 2);
-    ctx.fillStyle = "#3b82f6";
-    ctx.fill();
-    ctx.strokeStyle = "#1d4ed8";
-    ctx.lineWidth = 2;
-    ctx.stroke();
-
-    // yön oku
-    ctx.rotate(-yaw);
-    ctx.beginPath();
-    ctx.moveTo(0, 0);
-    ctx.lineTo(20, 0);
-    ctx.strokeStyle = "#fbbf24";
-    ctx.lineWidth = 3;
-    ctx.stroke();
-
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // reset
+    ctx.translate(offsetX, offsetY);
+    ctx.scale(scale, scale);
+    ctx.drawImage(tempCanvas, 0, 0);
     ctx.restore();
-  }
-}, [mapData, robotPose, zoomLevel]);
 
+    // robot çiz (map koordinat -> canvas koordinat)
+    if (robotPose) {
+      const px = (robotPose.position.x - origin.position.x) / resolution;
+      const py = mh - (robotPose.position.y - origin.position.y) / resolution;
 
+      const cx = offsetX + px * scale;
+      const cy = offsetY + py * scale;
+
+      const q = robotPose.orientation;
+      const yaw = Math.atan2(
+        2.0 * (q.w * q.z + q.x * q.y),
+        1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+      );
+
+      ctx.save();
+      ctx.translate(cx, cy);
+
+      // gövde
+      ctx.beginPath();
+      ctx.arc(0, 0, 8, 0, Math.PI * 2);
+      ctx.fillStyle = "#3b82f6";
+      ctx.fill();
+      ctx.strokeStyle = "#1d4ed8";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      // yön oku
+      ctx.rotate(-yaw);
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.lineTo(20, 0);
+      ctx.strokeStyle = "#fbbf24";
+      ctx.lineWidth = 3;
+      ctx.stroke();
+
+      ctx.restore();
+    }
+  }, [mapData, robotPose, zoomLevel]);
 
   return (
     <div style={{ 
@@ -317,7 +314,7 @@ export default function MapPage() {
                     fontWeight: '600'
                   }}
                 >
-                  🔌 Bağlan
+                  🔗 Bağlan
                 </button>
               ) : (
                 <button 
@@ -333,7 +330,7 @@ export default function MapPage() {
                     fontWeight: '600'
                   }}
                 >
-                  ⛔ Kes
+                  ❌ Kes
                 </button>
               )}
             </div>
@@ -438,11 +435,11 @@ export default function MapPage() {
             {/* ROSBridge Protocol Info */}
             <div style={{ marginTop: '0.75rem', padding: '0.75rem', background: '#0f172a', borderRadius: '0.375rem', border: '1px solid #334155' }}>
               <div style={{ fontSize: '0.75rem', color: '#cbd5e1' }}>
-                <div style={{ fontWeight: '600', marginBottom: '0.375rem' }}>📡 ROSBridge Protokol Bilgisi</div>
+                <div style={{ fontWeight: '600', marginBottom: '0.375rem' }}>ℹ️ ROSBridge Protokol Bilgisi</div>
                 <div style={{ fontSize: '0.625rem', color: '#94a3b8', lineHeight: 1.5 }}>
-                  • Bu sayfa doğrudan WebSocket üzerinden ROSBridge protokolü kullanır<br/>
-                  • Mesaj formatı: <code style={{ color: '#60a5fa' }}>&#123;"op": "subscribe", "topic": "/map"&#125;</code><br/>
-                  • Robot üzerinde rosbridge_server çalışıyor olmalı
+                  ℹ️ Bu sayfa doğrudan WebSocket üzerinden ROSBridge protokolü kullanır<br/>
+                  ℹ️ Mesaj formatı: <code style={{ color: '#60a5fa' }}>&#123;"op": "subscribe", "topic": "/map"&#125;</code><br/>
+                  ℹ️ Robot üzerinde rosbridge_server çalışıyor olmalı
                 </div>
               </div>
             </div>
@@ -461,57 +458,57 @@ export default function MapPage() {
           minHeight: 0
         }}>
           {mapData ? (
-  <div style={{ textAlign: "center", flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-    <div
-      ref={viewportRef}
-      style={{
-        flex: 1,
-        overflow: "hidden",
-        borderRadius: "0.5rem",
-        border: "2px solid #475569",
-        background: "#000",
-        position: "relative",
-        minHeight: 0
-      }}
-    >
-      <canvas
-        ref={canvasRef}
-        style={{
-          width: "100%",
-          height: "100%",
-          display: "block",
-        }}
-      />
-    </div>
+            <div style={{ textAlign: "center", flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+              <div
+                ref={viewportRef}
+                style={{
+                  flex: 1,
+                  overflow: "hidden",
+                  borderRadius: "0.5rem",
+                  border: "2px solid #475569",
+                  background: "#000",
+                  position: "relative",
+                  minHeight: 0
+                }}
+              >
+                <canvas
+                  ref={canvasRef}
+                  style={{
+                    width: "100%",
+                    height: "100%",
+                    display: "block",
+                  }}
+                />
+              </div>
 
-    <div
-      style={{
-        marginTop: "0.75rem",
-        fontSize: "0.75rem",
-        color: "#94a3b8",
-        display: "flex",
-        justifyContent: "center",
-        gap: "1.5rem",
-        flexWrap: "wrap",
-      }}
-    >
-      <div>📐 {mapData.info.width}×{mapData.info.height}px</div>
-      <div>📏 {mapData.info.resolution.toFixed(3)}m/px</div>
-      <div>🤖 Robot {robotPose ? "✅" : "⏳"}</div>
-    </div>
-  </div>
-) : (
-  <div style={{ textAlign: "center", padding: "4rem", color: "#64748b" }}>
-    <div style={{ fontSize: "3rem", marginBottom: "1rem" }}>🗺️</div>
-    <div style={{ fontSize: "1rem", fontWeight: "500" }}>
-      {isConnected ? "Harita bekleniyor..." : "Bağlantı kurun"}
-    </div>
-    <div style={{ fontSize: "0.75rem", marginTop: "0.5rem", color: "#475569" }}>
-      Topic: {mapTopic}
-    </div>
-  </div>
-)}
-</div>
+              <div
+                style={{
+                  marginTop: "0.75rem",
+                  fontSize: "0.75rem",
+                  color: "#94a3b8",
+                  display: "flex",
+                  justifyContent: "center",
+                  gap: "1.5rem",
+                  flexWrap: "wrap",
+                }}
+              >
+                <div>🌍 {mapData.info.width}×{mapData.info.height}px</div>
+                <div>🔍 {mapData.info.resolution.toFixed(3)}m/px</div>
+                <div>🤖 Robot {robotPose ? "Active" : "Inactive"}</div>
+              </div>
+            </div>
+          ) : (
+            <div style={{ textAlign: "center", padding: "4rem", color: "#64748b" }}>
+              <div style={{ fontSize: "3rem", marginBottom: "1rem" }}>🗺️</div>
+              <div style={{ fontSize: "1rem", fontWeight: "500" }}>
+                {isConnected ? "Harita bekleniyor..." : "Bağlantı kurun"}
+              </div>
+              <div style={{ fontSize: "0.75rem", marginTop: "0.5rem", color: "#475569" }}>
+                Topic: {mapTopic}
+              </div>
+            </div>
+          )}
+        </div>
 
         {/* Legend */}
         <div style={{ 
@@ -550,3 +547,4 @@ export default function MapPage() {
     </div>
   );
 }
+
