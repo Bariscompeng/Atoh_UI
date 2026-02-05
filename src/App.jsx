@@ -5,6 +5,7 @@ import TopNav from "./components/TopNav";
 import TeleopPage from "./pages/TeleopPage";
 import MapPage from "./pages/MapPage";
 import HumanSnapshots from "./pages/HumanSnapshots";
+import CoveragePage from "./pages/CoveragePage";
 import HealthPage from "./pages/HealthPage";
 
 export default function App() {
@@ -18,6 +19,7 @@ export default function App() {
             <Route path="/map" element={<MapPage />} />
             <Route path="/human-snapshots" element={<HumanSnapshots />} />
             <Route path="/health" element={<HealthPage />} />
+            <Route path="/coverage" element={<CoveragePage />} />
           </Routes>
         </div>
       </ROSProvider>

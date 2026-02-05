@@ -18,6 +18,8 @@ export default function TopNav() {
       <Link to="/map" style={active("/map")}>Live Map</Link>
       <Link to="/human-snapshots" style={active("/human-snapshots")}>Human</Link>
       <Link to="/health" style={active("/health")}>Health</Link>
+      <Link to="/coverage" style={active("/coverage")}>Coverage</Link>
+
 
 
     </div>
