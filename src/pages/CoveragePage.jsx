@@ -1,1531 +1,834 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import { useROS } from "../context/ROSContext";
 import * as ROSLIB from "roslib";
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
-function guessWsUrl() {
-  const host = window.location.hostname || "localhost";
-  return `ws://${host}:9090`;
+function prettyErr(e) {
+  if (!e) return "";
+  if (typeof e === "string") return e;
+  if (e?.message) return e.message;
+  try { return JSON.stringify(e); } catch { return String(e); }
 }
 
-function prettyErr(err) {
-  if (!err) return "";
-  if (typeof err === "string") return err;
-  if (err?.message) return err.message;
-  try {
-    return JSON.stringify(err);
-  } catch {
-    return String(err);
-  }
+function quaternionToYaw(q) {
+  const siny = 2.0 * (q.w * q.z + q.x * q.y);
+  const cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
+  return Math.atan2(siny, cosy);
 }
 
-/**
- * Polygon kenarı ile yatay/dikey çizgi kesişim noktası bul
- */
+function yawToQuaternion(yaw) {
+  return { x: 0, y: 0, z: Math.sin(yaw / 2), w: Math.cos(yaw / 2) };
+}
+
 function lineIntersection(x1, y1, x2, y2, x3, y3, x4, y4) {
   const denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
   if (Math.abs(denom) < 1e-10) return null;
-  
   const t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom;
   const u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom;
-  
-  if (t >= 0 && t <= 1 && u >= 0 && u <= 1) {
-    return {
-      x: x1 + t * (x2 - x1),
-      y: y1 + t * (y2 - y1)
-    };
-  }
+  if (t >= 0 && t <= 1 && u >= 0 && u <= 1)
+    return { x: x1 + t * (x2 - x1), y: y1 + t * (y2 - y1) };
   return null;
 }
 
-/**
- * Yatay veya dikey çizginin polygon ile kesişim noktalarını bul
- */
 function findPolygonIntersections(lineStart, lineEnd, polygon) {
   const intersections = [];
-  
   for (let i = 0; i < polygon.length; i++) {
     const p1 = polygon[i];
     const p2 = polygon[(i + 1) % polygon.length];
-    
-    const intersection = lineIntersection(
-      lineStart.x, lineStart.y, lineEnd.x, lineEnd.y,
-      p1.x, p1.y, p2.x, p2.y
-    );
-    
-    if (intersection) {
-      intersections.push(intersection);
-    }
+    const pt = lineIntersection(lineStart.x, lineStart.y, lineEnd.x, lineEnd.y, p1.x, p1.y, p2.x, p2.y);
+    if (pt) intersections.push(pt);
   }
-  
-  // X veya Y'ye göre sırala
-  if (Math.abs(lineEnd.x - lineStart.x) > Math.abs(lineEnd.y - lineStart.y)) {
-    // Yatay çizgi - X'e göre sırala
+  if (Math.abs(lineEnd.x - lineStart.x) > Math.abs(lineEnd.y - lineStart.y))
     intersections.sort((a, b) => a.x - b.x);
-  } else {
-    // Dikey çizgi - Y'ye göre sırala
+  else
     intersections.sort((a, b) => a.y - b.y);
-  }
-  
   return intersections;
 }
 
-/**
- * Frontend'de path hesaplama fonksiyonları
- * Seçilen stil ve parametrelere göre preview path oluşturur
- * Path seçilen polygon'un İÇİNDE kalır
- */
 function generatePreviewPath(points, style, lineSpacing, sweepAngle, startCorner) {
   if (points.length !== 4) return [];
-
-  // Noktaları saat yönünde sırala (convex hull için)
-  const center = {
-    x: points.reduce((sum, p) => sum + p.x, 0) / 4,
-    y: points.reduce((sum, p) => sum + p.y, 0) / 4
-  };
-
-  const sortedPoints = [...points].sort((a, b) => {
-    const angleA = Math.atan2(a.y - center.y, a.x - center.x);
-    const angleB = Math.atan2(b.y - center.y, b.x - center.x);
-    return angleA - angleB;
-  });
-
-  // Başlama köşesine göre döndür
-  const polygon = [];
-  for (let i = 0; i < 4; i++) {
-    polygon.push(sortedPoints[(i + startCorner) % 4]);
-  }
-
-  // Bounding box hesapla
-  const minX = Math.min(...polygon.map(p => p.x));
-  const maxX = Math.max(...polygon.map(p => p.x));
-  const minY = Math.min(...polygon.map(p => p.y));
-  const maxY = Math.max(...polygon.map(p => p.y));
-
-  const width = maxX - minX;
-  const height = maxY - minY;
-
+  const center = { x: points.reduce((s, p) => s + p.x, 0) / 4, y: points.reduce((s, p) => s + p.y, 0) / 4 };
+  const sortedPoints = [...points].sort((a, b) => Math.atan2(a.y - center.y, a.x - center.x) - Math.atan2(b.y - center.y, b.x - center.x));
+  const polygon = Array.from({ length: 4 }, (_, i) => sortedPoints[(i + startCorner) % 4]);
+  const minX = Math.min(...polygon.map(p => p.x)), maxX = Math.max(...polygon.map(p => p.x));
+  const minY = Math.min(...polygon.map(p => p.y)), maxY = Math.max(...polygon.map(p => p.y));
+  const width = maxX - minX, height = maxY - minY;
   const path = [];
 
   if (style === "zigzag") {
-    // Yatay zigzag pattern - polygon içinde
     const numLines = Math.max(2, Math.floor(height / lineSpacing));
-    const actualSpacing = height / numLines;
-
+    const spacing = height / numLines;
     for (let i = 0; i <= numLines; i++) {
-      const y = minY + i * actualSpacing;
-      
-      // Bu y seviyesinde polygon ile kesişim noktalarını bul
-      const lineStart = { x: minX - 1, y };
-      const lineEnd = { x: maxX + 1, y };
-      const intersections = findPolygonIntersections(lineStart, lineEnd, polygon);
-      
-      if (intersections.length >= 2) {
-        const leftPt = intersections[0];
-        const rightPt = intersections[intersections.length - 1];
-        
-        if (i % 2 === 0) {
-          // Soldan sağa
-          path.push({ x: leftPt.x, y: leftPt.y });
-          path.push({ x: rightPt.x, y: rightPt.y });
-        } else {
-          // Sağdan sola
-          path.push({ x: rightPt.x, y: rightPt.y });
-          path.push({ x: leftPt.x, y: leftPt.y });
-        }
+      const y = minY + i * spacing;
+      const pts = findPolygonIntersections({ x: minX - 1, y }, { x: maxX + 1, y }, polygon);
+      if (pts.length >= 2) {
+        if (i % 2 === 0) { path.push(pts[0]); path.push(pts[pts.length - 1]); }
+        else { path.push(pts[pts.length - 1]); path.push(pts[0]); }
       }
     }
   } else if (style === "ladder") {
-    // Dikey ladder pattern - polygon içinde
     const numLines = Math.max(2, Math.floor(width / lineSpacing));
-    const actualSpacing = width / numLines;
-
+    const spacing = width / numLines;
     for (let i = 0; i <= numLines; i++) {
-      const x = minX + i * actualSpacing;
-      
-      // Bu x seviyesinde polygon ile kesişim noktalarını bul
-      const lineStart = { x, y: minY - 1 };
-      const lineEnd = { x, y: maxY + 1 };
-      const intersections = findPolygonIntersections(lineStart, lineEnd, polygon);
-      
-      if (intersections.length >= 2) {
-        const bottomPt = intersections[0];
-        const topPt = intersections[intersections.length - 1];
-        
-        if (i % 2 === 0) {
-          // Aşağıdan yukarı
-          path.push({ x: bottomPt.x, y: bottomPt.y });
-          path.push({ x: topPt.x, y: topPt.y });
-        } else {
-          // Yukarıdan aşağı
-          path.push({ x: topPt.x, y: topPt.y });
-          path.push({ x: bottomPt.x, y: bottomPt.y });
-        }
+      const x = minX + i * spacing;
+      const pts = findPolygonIntersections({ x, y: minY - 1 }, { x, y: maxY + 1 }, polygon);
+      if (pts.length >= 2) {
+        if (i % 2 === 0) { path.push(pts[0]); path.push(pts[pts.length - 1]); }
+        else { path.push(pts[pts.length - 1]); path.push(pts[0]); }
       }
     }
   } else if (style === "diagonal") {
-    // Diagonal pattern - polygon içinde
     const diagonal = Math.sqrt(width * width + height * height);
     const numLines = Math.max(2, Math.floor(diagonal / lineSpacing));
     const angleRad = (sweepAngle * Math.PI) / 180;
-    
-    const cosA = Math.cos(angleRad);
-    const sinA = Math.sin(angleRad);
-
+    const cosA = Math.cos(angleRad), sinA = Math.sin(angleRad);
     for (let i = 0; i <= numLines; i++) {
       const offset = (i / numLines) * diagonal - diagonal / 2;
-      
-      // Diagonal çizgi - uzun çizgi oluştur
-      const perpX = offset * cosA;
-      const perpY = offset * sinA;
-      
-      const lineStart = {
-        x: center.x + perpX - diagonal * sinA,
-        y: center.y + perpY + diagonal * cosA
-      };
-      const lineEnd = {
-        x: center.x + perpX + diagonal * sinA,
-        y: center.y + perpY - diagonal * cosA
-      };
-      
-      const intersections = findPolygonIntersections(lineStart, lineEnd, polygon);
-      
-      if (intersections.length >= 2) {
-        const pt1 = intersections[0];
-        const pt2 = intersections[intersections.length - 1];
-        
-        if (i % 2 === 0) {
-          path.push({ x: pt1.x, y: pt1.y });
-          path.push({ x: pt2.x, y: pt2.y });
-        } else {
-          path.push({ x: pt2.x, y: pt2.y });
-          path.push({ x: pt1.x, y: pt1.y });
-        }
+      const px = offset * cosA, py = offset * sinA;
+      const ls = { x: center.x + px - diagonal * sinA, y: center.y + py + diagonal * cosA };
+      const le = { x: center.x + px + diagonal * sinA, y: center.y + py - diagonal * cosA };
+      const pts = findPolygonIntersections(ls, le, polygon);
+      if (pts.length >= 2) {
+        if (i % 2 === 0) { path.push(pts[0]); path.push(pts[pts.length - 1]); }
+        else { path.push(pts[pts.length - 1]); path.push(pts[0]); }
       }
     }
   }
-
   return path;
 }
 
-/**
- * Coverage Planner Frontend - ROS 2 + Nav2 Integration
- * Cartographer harita + Nokta seçimi + Path gönderimi + Frontend Preview
- */
+// ─── Modes ────────────────────────────────────────────────────────────────────
+const MODE_IDLE     = "idle";
+const MODE_SELECT   = "select";
+const MODE_GOALPOSE = "goalpose";
+
+// ─── Component ────────────────────────────────────────────────────────────────
 export default function CoveragePage() {
-  // ---- ROS bağlantısı ----
-  const [wsUrl, setWsUrl] = useState(guessWsUrl());
-  const [ros, setRos] = useState(null);
-  const [isConnected, setIsConnected] = useState(false);
-  const [statusText, setStatusText] = useState("Bağlı değil");
-  const [errorText, setErrorText] = useState("");
+  const { ros, isConnected, status: globalStatus, errorText: globalErrorText, reconnect } = useROS();
 
-  // ---- MAP state (Cartographer) ----
+  const [pageStatus, setPageStatus] = useState("");
+  const [pageError,  setPageError]  = useState("");
+
+  // Map
   const [mapTopicName, setMapTopicName] = useState("/map");
-  const [mapMsg, setMapMsg] = useState(null);
-  const [mapInfo, setMapInfo] = useState(null);
+  const [mapInfo,      setMapInfo]      = useState(null);
   const [mapImageData, setMapImageData] = useState(null);
-  const [mapLoading, setMapLoading] = useState(false);
+  const [mapLoading,   setMapLoading]   = useState(false);
 
-  // ---- UI selection state ----
-  const [points, setPoints] = useState([]);
-  const [selectMode, setSelectMode] = useState(false);
+  // Robot pose
+  const [robotPose,  setRobotPose]  = useState(null);
+  const [poseSource, setPoseSource] = useState("");
 
-  // ---- Path state (ROS'tan gelen) ----
-  const [pathMsg, setPathMsg] = useState(null);
-  const [pathTimestamp, setPathTimestamp] = useState(0);
+  // Interaction
+  const [points,     setPoints]     = useState([]);
+  const [activeMode, setActiveMode] = useState(MODE_IDLE);
 
-  // ---- Preview Path state (Frontend'de hesaplanan) ----
+  // Goal pose drag
+  const goalDragRef  = useRef(null);
+  const [goalDragEnd, setGoalDragEnd] = useState(null);
+
+  // Path
+  const [pathMsg,     setPathMsg]     = useState(null);
   const [showPreview, setShowPreview] = useState(true);
 
-  // ---- Style parameters (ROS 2 parametreleri) ----
-  const [style, setStyle] = useState("zigzag");
+  // Exec
+  const [execStatus,   setExecStatus]   = useState("idle");
+  const [execFeedback, setExecFeedback] = useState("");
+
+  // Style
+  const [style,       setStyle]       = useState("zigzag");
   const [lineSpacing, setLineSpacing] = useState(0.6);
-  const [sweepAngle, setSweepAngle] = useState(90);
+  const [sweepAngle,  setSweepAngle]  = useState(90);
   const [startCorner, setStartCorner] = useState(0);
 
-  // ---- UI state ----
   const [showSettings, setShowSettings] = useState(false);
-  const [isExecuting, setIsExecuting] = useState(false);
 
-  // ---- Topics ----
-  const fieldPolyTopic = "/coverage/field_polygon";
-  const pathTopicName = "/coverage/path";
-  const recomputeSrvName = "/coverage/recompute";
-
-  // ---- Canvas refs ----
-  const canvasRef = useRef(null);
+  const canvasRef    = useRef(null);
   const containerRef = useRef(null);
-  const mapTopicRef = useRef(null);
+  const mapTopicRef  = useRef(null);
   const pathTopicRef = useRef(null);
+  const amclRef      = useRef(null);
+  const odomRef      = useRef(null);
 
-  // ---- Preview Path hesapla (useMemo ile optimize) ----
-  const previewPath = useMemo(() => {
-    if (points.length !== 4) return [];
-    return generatePreviewPath(points, style, lineSpacing, sweepAngle, startCorner);
-  }, [points, style, lineSpacing, sweepAngle, startCorner]);
+  const fieldPolyTopic   = "/coverage/field_polygon";
+  const pathTopicName    = "/coverage/path";
+  const recomputeSrvName = "/coverage/recompute";
+  const goalPoseTopic    = "/goal_pose";
 
-  // ---- ROS connect ----
-  useEffect(() => {
-    const r = new ROSLIB.Ros({ url: wsUrl });
+  const previewPath = useMemo(
+    () => generatePreviewPath(points, style, lineSpacing, sweepAngle, startCorner),
+    [points, style, lineSpacing, sweepAngle, startCorner]
+  );
 
-    r.on("connection", () => {
-      setRos(r);
-      setIsConnected(true);
-      setStatusText("ROSBridge bağlı");
-      setErrorText("");
-    });
+  const displayStatus = pageStatus || globalStatus;
+  const displayError  = pageError  || globalErrorText;
 
-    r.on("error", (err) => {
-      setIsConnected(false);
-      setStatusText("Bağlantı hatası");
-      setErrorText(prettyErr(err));
-    });
-
-    r.on("close", () => {
-      setIsConnected(false);
-      setStatusText("Bağlı değil");
-    });
-
-    return () => {
-      try { r.close(); } catch {}
+  // ── canvasToWorld ──────────────────────────────────────────────────────────
+  const canvasToWorld = useCallback((cx, cy) => {
+    if (!mapInfo || !canvasRef.current) return { wx: 0, wy: 0 };
+    const sc = canvasRef.current.width / mapInfo.width;
+    return {
+      wx: mapInfo.originX + (cx / sc) * mapInfo.resolution,
+      wy: mapInfo.originY + (mapInfo.height - cy / sc) * mapInfo.resolution,
     };
-  }, [wsUrl]);
+  }, [mapInfo]);
 
-  // ---- Subscribe /map (Cartographer) ----
+  // ── Subscribe /map ─────────────────────────────────────────────────────────
   useEffect(() => {
     if (!ros || !isConnected) return;
-
-    if (mapTopicRef.current) {
-      try { mapTopicRef.current.unsubscribe(); } catch {}
-    }
-
+    if (mapTopicRef.current) { try { mapTopicRef.current.unsubscribe(); } catch {} }
     setMapLoading(true);
-    setMapMsg(null);
     setMapImageData(null);
 
     const topic = new ROSLIB.Topic({
-      ros,
-      name: mapTopicName,
+      ros, name: mapTopicName,
       messageType: "nav_msgs/msg/OccupancyGrid",
-      throttle_rate: 200,
-      queue_size: 1,
+      throttle_rate: 500, queue_size: 1,
     });
-
     topic.subscribe((msg) => {
       setMapLoading(false);
-
-      if (!msg?.info?.width || !msg?.info?.height) {
-        setErrorText("Harita verisi geçersiz");
-        return;
-      }
-
-      setMapMsg(msg);
-      setErrorText("");
-
+      if (!msg?.info?.width || !msg?.info?.height) { setPageError("Harita verisi geçersiz"); return; }
+      setPageError("");
       const info = {
-        resolution: msg.info.resolution,
-        width: msg.info.width,
-        height: msg.info.height,
-        originX: msg.info.origin.position.x,
-        originY: msg.info.origin.position.y,
+        resolution: msg.info.resolution, width: msg.info.width, height: msg.info.height,
+        originX: msg.info.origin.position.x, originY: msg.info.origin.position.y,
       };
       setMapInfo(info);
-
-      // OccupancyGrid -> ImageData
-      const w = info.width;
-      const h = info.height;
+      const w = info.width, h = info.height;
       const img = new ImageData(w, h);
-
       for (let i = 0; i < w * h; i++) {
         const v = msg.data[i];
-        let c;
-        if (v < 0) c = 205;
-        else c = 255 - clamp((v / 100) * 255, 0, 255);
+        const c = v < 0 ? 128 : 255 - clamp((v / 100) * 255, 0, 255);
         const idx = i * 4;
-        img.data[idx + 0] = c;
-        img.data[idx + 1] = c;
-        img.data[idx + 2] = c;
-        img.data[idx + 3] = 255;
+        img.data[idx] = c; img.data[idx+1] = c; img.data[idx+2] = c; img.data[idx+3] = 255;
       }
       setMapImageData(img);
     });
-
     mapTopicRef.current = topic;
-
-    return () => {
-      try { topic.unsubscribe(); } catch {}
-      mapTopicRef.current = null;
-    };
+    return () => { try { topic.unsubscribe(); } catch {} };
   }, [ros, isConnected, mapTopicName]);
 
-  // ---- Subscribe /coverage/path (ROS'tan gelen path) ----
+  // ── Subscribe /coverage/path ───────────────────────────────────────────────
   useEffect(() => {
     if (!ros || !isConnected) return;
-
-    if (pathTopicRef.current) {
-      try { pathTopicRef.current.unsubscribe(); } catch {}
-    }
-
-    console.log("📡 Path topic'e subscribe ediliyor...");
-
+    if (pathTopicRef.current) { try { pathTopicRef.current.unsubscribe(); } catch {} }
     const topic = new ROSLIB.Topic({
-      ros,
-      name: pathTopicName,
-      messageType: "nav_msgs/msg/Path",
-      throttle_rate: 50,
-      queue_size: 1,
+      ros, name: pathTopicName, messageType: "nav_msgs/msg/Path",
+      throttle_rate: 100, queue_size: 1,
     });
-
-    topic.subscribe((msg) => {
-      const msgTime = msg.header?.stamp?.sec || Date.now() / 1000;
-      console.log(`📍 YENİ Path alındı: ${msg.poses.length} poses, timestamp=${msgTime}`);
-      setPathMsg(msg);
-      setPathTimestamp(msgTime);
-    });
-
+    topic.subscribe((msg) => setPathMsg(msg));
     pathTopicRef.current = topic;
+    return () => { try { topic.unsubscribe(); } catch {} };
+  }, [ros, isConnected]);
+
+  // ── Subscribe robot pose (amcl + odom fallback) ────────────────────────────
+  useEffect(() => {
+    if (!ros || !isConnected) return;
+    if (amclRef.current) { try { amclRef.current.unsubscribe(); } catch {} }
+    if (odomRef.current) { try { odomRef.current.unsubscribe(); } catch {} }
+
+    let hasAmcl = false;
+
+    const amcl = new ROSLIB.Topic({
+      ros, name: "/amcl_pose",
+      messageType: "geometry_msgs/msg/PoseWithCovarianceStamped",
+      throttle_rate: 100, queue_size: 1,
+    });
+    amcl.subscribe((msg) => {
+      hasAmcl = true;
+      const p = msg.pose.pose;
+      setRobotPose({ x: p.position.x, y: p.position.y, yaw: quaternionToYaw(p.orientation) });
+      setPoseSource("amcl");
+    });
+    amclRef.current = amcl;
+
+    const odom = new ROSLIB.Topic({
+      ros, name: "/odom",
+      messageType: "nav_msgs/msg/Odometry",
+      throttle_rate: 100, queue_size: 1,
+    });
+    odom.subscribe((msg) => {
+      if (hasAmcl) return;
+      const p = msg.pose.pose;
+      setRobotPose({ x: p.position.x, y: p.position.y, yaw: quaternionToYaw(p.orientation) });
+      setPoseSource("odom");
+    });
+    odomRef.current = odom;
 
     return () => {
-      try { topic.unsubscribe(); } catch {}
-      pathTopicRef.current = null;
+      try { amcl.unsubscribe(); } catch {}
+      try { odom.unsubscribe(); } catch {}
     };
   }, [ros, isConnected]);
 
-  // ---- Draw canvas ----
+  // ── Draw canvas ────────────────────────────────────────────────────────────
   useEffect(() => {
-    const canvas = canvasRef.current;
+    const canvas    = canvasRef.current;
     const container = containerRef.current;
     if (!canvas || !container || !mapInfo || !mapImageData) return;
 
-    const containerRect = container.getBoundingClientRect();
-    const maxW = containerRect.width;
-    const maxH = containerRect.height;
-
-    const mapW = mapInfo.width;
-    const mapH = mapInfo.height;
-
-    const scale = Math.min(maxW / mapW, maxH / mapH);
+    const rect  = container.getBoundingClientRect();
+    const mapW  = mapInfo.width, mapH = mapInfo.height;
+    const scale = Math.min(rect.width / mapW, rect.height / mapH);
     const drawW = Math.floor(mapW * scale);
     const drawH = Math.floor(mapH * scale);
 
-    canvas.width = drawW;
+    canvas.width  = drawW;
     canvas.height = drawH;
-    canvas.style.width = drawW + "px";
+    canvas.style.width  = drawW + "px";
     canvas.style.height = drawH + "px";
 
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    // Harita rasterini çiz
+    // Draw map
     const off = document.createElement("canvas");
-    off.width = mapW;
-    off.height = mapH;
-    const offCtx = off.getContext("2d");
-    if (!offCtx) return;
-    
-    offCtx.putImageData(mapImageData, 0, 0);
-
+    off.width = mapW; off.height = mapH;
+    off.getContext("2d").putImageData(mapImageData, 0, 0);
     ctx.clearRect(0, 0, drawW, drawH);
     ctx.imageSmoothingEnabled = false;
     ctx.drawImage(off, 0, 0, drawW, drawH);
 
-    // Koordinat dönüşüm fonksiyonları
-    const worldToMapPixel = (x, y) => {
-      const px = (x - mapInfo.originX) / mapInfo.resolution;
-      const py = (y - mapInfo.originY) / mapInfo.resolution;
-      return { mx: px, my: py };
-    };
-
-    const mapPixelToCanvas = (mx, my) => {
-      return { cx: mx * scale, cy: (mapH - my) * scale };
-    };
-
-    // Ok çizme fonksiyonu
-    const drawArrow = (fromX, fromY, toX, toY, color, headLength = 8) => {
-      const angle = Math.atan2(toY - fromY, toX - fromX);
-      
-      ctx.strokeStyle = color;
-      ctx.fillStyle = color;
-      ctx.lineWidth = 2;
-      
-      // Çizgi
-      ctx.beginPath();
-      ctx.moveTo(fromX, fromY);
-      ctx.lineTo(toX, toY);
-      ctx.stroke();
-      
-      // Ok başı
-      ctx.beginPath();
-      ctx.moveTo(toX, toY);
-      ctx.lineTo(
-        toX - headLength * Math.cos(angle - Math.PI / 6),
-        toY - headLength * Math.sin(angle - Math.PI / 6)
-      );
-      ctx.lineTo(
-        toX - headLength * Math.cos(angle + Math.PI / 6),
-        toY - headLength * Math.sin(angle + Math.PI / 6)
-      );
-      ctx.closePath();
-      ctx.fill();
-    };
-
-    // ---- Preview Path'i Çiz (Mavi - Frontend hesaplı) ----
-    if (showPreview && previewPath.length > 1) {
-      console.log(`🎨 Preview Path çiziliyor: ${previewPath.length} points, stil: ${style}`);
-      
-      ctx.globalAlpha = 0.9;
-
-      // Her çizgi segmentini ok ile çiz
-      for (let i = 0; i < previewPath.length - 1; i++) {
-        const wp1 = previewPath[i];
-        const wp2 = previewPath[i + 1];
-        
-        const { mx: mx1, my: my1 } = worldToMapPixel(wp1.x, wp1.y);
-        const { cx: cx1, cy: cy1 } = mapPixelToCanvas(mx1, my1);
-        
-        const { mx: mx2, my: my2 } = worldToMapPixel(wp2.x, wp2.y);
-        const { cx: cx2, cy: cy2 } = mapPixelToCanvas(mx2, my2);
-
-        // Her segmenti farklı renkte veya ok ile çiz
-        drawArrow(cx1, cy1, cx2, cy2, "#3b82f6", 10);
-      }
-
-      // Başlangıç noktasını işaretle
-      if (previewPath.length > 0) {
-        const startPt = previewPath[0];
-        const { mx, my } = worldToMapPixel(startPt.x, startPt.y);
-        const { cx, cy } = mapPixelToCanvas(mx, my);
-        
-        ctx.fillStyle = "#22c55e";
-        ctx.beginPath();
-        ctx.arc(cx, cy, 8, 0, Math.PI * 2);
-        ctx.fill();
-        
-        ctx.fillStyle = "#ffffff";
-        ctx.font = "bold 10px sans-serif";
-        ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-        ctx.fillText("S", cx, cy);
-      }
-
-      // Bitiş noktasını işaretle
-      if (previewPath.length > 1) {
-        const endPt = previewPath[previewPath.length - 1];
-        const { mx, my } = worldToMapPixel(endPt.x, endPt.y);
-        const { cx, cy } = mapPixelToCanvas(mx, my);
-        
-        ctx.fillStyle = "#ef4444";
-        ctx.beginPath();
-        ctx.arc(cx, cy, 8, 0, Math.PI * 2);
-        ctx.fill();
-        
-        ctx.fillStyle = "#ffffff";
-        ctx.font = "bold 10px sans-serif";
-        ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-        ctx.fillText("E", cx, cy);
-      }
-
-      ctx.globalAlpha = 1;
-    }
-
-    // ---- ROS'tan Gelen Path'i Çiz (Yeşil) - Sadece preview kapalıyken veya ROS path varken ----
-    // Preview açıkken ROS path'i gösterme (çakışma olmasın)
-    if (pathMsg?.poses?.length > 1 && !showPreview) {
-      console.log(`🎨 ROS Path çiziliyor: ${pathMsg.poses.length} poses`);
-      ctx.lineWidth = 3;
-      ctx.strokeStyle = "#10b981";
-      ctx.globalAlpha = 0.8;
-      ctx.setLineDash([5, 5]);
-
-      ctx.beginPath();
-      for (let i = 0; i < pathMsg.poses.length; i++) {
-        const wp = pathMsg.poses[i].pose.position;
-        const { mx, my } = worldToMapPixel(wp.x, wp.y);
-        const { cx, cy } = mapPixelToCanvas(mx, my);
-        if (i === 0) ctx.moveTo(cx, cy);
-        else ctx.lineTo(cx, cy);
-      }
-      ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.globalAlpha = 1;
-    }
-
-    // ---- Seçilen Noktaları Çiz (Kırmızı kenar) ----
-    if (points.length > 0) {
-      console.log(`🎨 Noktalar çiziliyor: ${points.length} nokta`);
-      ctx.lineWidth = 3;
-      ctx.strokeStyle = "#f97316";
-      ctx.globalAlpha = 1;
-
-      const cvsPts = points.map((p) => {
-        const { mx, my } = worldToMapPixel(p.x, p.y);
-        return mapPixelToCanvas(mx, my);
-      });
-
-      // Polygon kenarları
-      ctx.beginPath();
-      ctx.moveTo(cvsPts[0].cx, cvsPts[0].cy);
-      for (let i = 1; i < cvsPts.length; i++) {
-        ctx.lineTo(cvsPts[i].cx, cvsPts[i].cy);
-      }
-      if (points.length === 4) ctx.closePath();
-      ctx.stroke();
-
-      // Polygon fill (şeffaf)
-      if (points.length === 4) {
-        ctx.fillStyle = "rgba(249, 115, 22, 0.1)";
-        ctx.beginPath();
-        ctx.moveTo(cvsPts[0].cx, cvsPts[0].cy);
-        for (let i = 1; i < cvsPts.length; i++) {
-          ctx.lineTo(cvsPts[i].cx, cvsPts[i].cy);
-        }
-        ctx.closePath();
-        ctx.fill();
-      }
-
-      // Noktalar
-      for (let i = 0; i < cvsPts.length; i++) {
-        const pt = cvsPts[i];
-
-        ctx.fillStyle = i === startCorner ? "#22c55e" : "#f97316";
-        ctx.beginPath();
-        ctx.arc(pt.cx, pt.cy, 9, 0, Math.PI * 2);
-        ctx.fill();
-
-        ctx.strokeStyle = "#ffffff";
-        ctx.lineWidth = 2;
-        ctx.stroke();
-
-        ctx.fillStyle = "#ffffff";
-        ctx.font = "bold 12px sans-serif";
-        ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-        ctx.fillText(String(i + 1), pt.cx, pt.cy);
-      }
-    }
-  }, [mapInfo, mapImageData, points, pathMsg, pathTimestamp, previewPath, showPreview, style, startCorner]);
-
-  // ---- Canvas tıklama (Nokta seçimi) ----
-  const onCanvasClick = (e) => {
-    if (!selectMode || !mapInfo || !mapImageData) return;
-    const canvas = canvasRef.current;
-    const container = containerRef.current;
-    if (!canvas || !container) return;
-
-    const canvasRect = canvas.getBoundingClientRect();
-    
-    const clickX = e.clientX - canvasRect.left;
-    const clickY = e.clientY - canvasRect.top;
-
-    const mapW = mapInfo.width;
-    const mapH = mapInfo.height;
-    const canvasW = canvasRect.width;
-    const canvasH = canvasRect.height;
-
-    const scale = Math.min(canvasW / mapW, canvasH / mapH);
-    
-    const scaledMapW = mapW * scale;
-    const scaledMapH = mapH * scale;
-    
-    const mapOffsetX = (canvasW - scaledMapW) / 2;
-    const mapOffsetY = (canvasH - scaledMapH) / 2;
-
-    if (
-      clickX < mapOffsetX ||
-      clickX > mapOffsetX + scaledMapW ||
-      clickY < mapOffsetY ||
-      clickY > mapOffsetY + scaledMapH
-    ) {
-      console.log("Tıklama harita dışında");
-      return;
-    }
-
-    const mapPixelX = (clickX - mapOffsetX) / scale;
-    const mapPixelY = (clickY - mapOffsetY) / scale;
-
-    if (mapPixelX < 0 || mapPixelX >= mapW || mapPixelY < 0 || mapPixelY >= mapH) {
-      console.log("Harita bounds dışında");
-      return;
-    }
-
-    const wx = mapInfo.originX + mapPixelX * mapInfo.resolution;
-    const wy = mapInfo.originY + (mapH - mapPixelY) * mapInfo.resolution;
-
-    console.log(`Tıklama: World (${wx.toFixed(2)}, ${wy.toFixed(2)})`);
-
-    setPoints((prev) => {
-      if (prev.length >= 4) {
-        alert("Zaten 4 nokta seçilmiş. Temizle butonuyla sıfırla.");
-        return prev;
-      }
-      return [...prev, { x: wx, y: wy }];
+    const w2c = (wx, wy) => ({
+      cx: ((wx - mapInfo.originX) / mapInfo.resolution) * scale,
+      cy: (mapH - (wy - mapInfo.originY) / mapInfo.resolution) * scale,
     });
+
+    const drawArrow = (fx, fy, tx, ty, color, head = 8, lw = 2) => {
+      const angle = Math.atan2(ty - fy, tx - fx);
+      ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw;
+      ctx.beginPath(); ctx.moveTo(fx, fy); ctx.lineTo(tx, ty); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(tx, ty);
+      ctx.lineTo(tx - head * Math.cos(angle - Math.PI / 6), ty - head * Math.sin(angle - Math.PI / 6));
+      ctx.lineTo(tx - head * Math.cos(angle + Math.PI / 6), ty - head * Math.sin(angle + Math.PI / 6));
+      ctx.closePath(); ctx.fill();
+    };
+
+    // Preview path
+    if (showPreview && previewPath.length > 1) {
+      ctx.globalAlpha = 0.85;
+      for (let i = 0; i < previewPath.length - 1; i++) {
+        const { cx: x1, cy: y1 } = w2c(previewPath[i].x, previewPath[i].y);
+        const { cx: x2, cy: y2 } = w2c(previewPath[i+1].x, previewPath[i+1].y);
+        drawArrow(x1, y1, x2, y2, "#3b82f6", 10, 2);
+      }
+      const { cx: sx, cy: sy } = w2c(previewPath[0].x, previewPath[0].y);
+      ctx.fillStyle = "#22c55e"; ctx.beginPath(); ctx.arc(sx, sy, 8, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#fff"; ctx.font = "bold 10px monospace"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText("S", sx, sy);
+      const ep = previewPath[previewPath.length - 1];
+      const { cx: ex, cy: ey } = w2c(ep.x, ep.y);
+      ctx.fillStyle = "#ef4444"; ctx.beginPath(); ctx.arc(ex, ey, 8, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#fff"; ctx.font = "bold 10px monospace"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText("E", ex, ey);
+      ctx.globalAlpha = 1;
+    }
+
+    // ROS path
+    if (pathMsg?.poses?.length > 1 && !showPreview) {
+      ctx.globalAlpha = 0.9; ctx.lineWidth = 2.5; ctx.strokeStyle = "#10b981"; ctx.setLineDash([6, 4]);
+      ctx.beginPath();
+      pathMsg.poses.forEach((ps, i) => {
+        const { cx, cy } = w2c(ps.pose.position.x, ps.pose.position.y);
+        if (i === 0) ctx.moveTo(cx, cy); else ctx.lineTo(cx, cy);
+      });
+      ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1;
+    }
+
+    // Polygon selection
+    if (points.length > 0) {
+      const cvsPts = points.map(p => w2c(p.x, p.y));
+      ctx.lineWidth = 2.5; ctx.strokeStyle = "#f97316"; ctx.setLineDash([]);
+      ctx.beginPath(); ctx.moveTo(cvsPts[0].cx, cvsPts[0].cy);
+      for (let i = 1; i < cvsPts.length; i++) ctx.lineTo(cvsPts[i].cx, cvsPts[i].cy);
+      if (points.length === 4) {
+        ctx.closePath(); ctx.stroke();
+        ctx.fillStyle = "rgba(249,115,22,0.07)"; ctx.fill();
+      } else { ctx.stroke(); }
+      cvsPts.forEach(({ cx, cy }, i) => {
+        ctx.fillStyle = i === startCorner ? "#22c55e" : "#f97316";
+        ctx.beginPath(); ctx.arc(cx, cy, 9, 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.stroke();
+        ctx.fillStyle = "#fff"; ctx.font = "bold 11px monospace";
+        ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        ctx.fillText(String(i + 1), cx, cy);
+      });
+    }
+
+    // Robot pose — sarı daire + yön oku
+    if (robotPose) {
+      const { cx: rx, cy: ry } = w2c(robotPose.x, robotPose.y);
+      const arrowLen = 22;
+      const ax = rx + arrowLen * Math.cos(-robotPose.yaw);
+      const ay = ry + arrowLen * Math.sin(-robotPose.yaw);
+      // Glow
+      const grad = ctx.createRadialGradient(rx, ry, 0, rx, ry, 22);
+      grad.addColorStop(0, "rgba(250,204,21,0.45)");
+      grad.addColorStop(1, "rgba(250,204,21,0)");
+      ctx.fillStyle = grad; ctx.beginPath(); ctx.arc(rx, ry, 22, 0, Math.PI * 2); ctx.fill();
+      // Body
+      ctx.fillStyle = "#facc15"; ctx.strokeStyle = "#0b1120"; ctx.lineWidth = 2.5;
+      ctx.beginPath(); ctx.arc(rx, ry, 11, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      // Arrow
+      drawArrow(rx, ry, ax, ay, "#0b1120", 7, 2.5);
+      // Label
+      ctx.fillStyle = "#facc15"; ctx.font = "bold 9px monospace";
+      ctx.textAlign = "center"; ctx.textBaseline = "top";
+      ctx.fillText("ROBOT", rx, ry + 14);
+    }
+
+    // Goal pose drag preview
+    if (goalDragRef.current && goalDragEnd) {
+      const { canvasX: gx, canvasY: gy } = goalDragRef.current;
+      const { canvasX: ex, canvasY: ey } = goalDragEnd;
+      // Circle
+      ctx.fillStyle = "rgba(168,85,247,0.25)";
+      ctx.strokeStyle = "#a855f7"; ctx.lineWidth = 2.5;
+      ctx.beginPath(); ctx.arc(gx, gy, 13, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      // Arrow
+      const len = Math.max(25, Math.sqrt((ex-gx)**2 + (ey-gy)**2));
+      const ang = Math.atan2(ey - gy, ex - gx);
+      const headX = gx + Math.min(len, 60) * Math.cos(ang);
+      const headY = gy + Math.min(len, 60) * Math.sin(ang);
+      drawArrow(gx, gy, headX, headY, "#a855f7", 12, 3);
+      ctx.fillStyle = "#a855f7"; ctx.font = "bold 9px monospace";
+      ctx.textAlign = "center"; ctx.textBaseline = "top";
+      ctx.fillText("GOAL", gx, gy + 16);
+    }
+
+  }, [mapInfo, mapImageData, points, pathMsg, previewPath, showPreview, startCorner, robotPose, goalDragEnd]);
+
+  // ── Canvas helpers ─────────────────────────────────────────────────────────
+  const getCanvasPos = (e, canvas) => {
+    const r = canvas.getBoundingClientRect();
+    return {
+      canvasX: (e.clientX - r.left) * (canvas.width  / r.width),
+      canvasY: (e.clientY - r.top)  * (canvas.height / r.height),
+    };
   };
 
-  // ---- Polygon gönder ----
-  const publishPolygon = async () => {
-    if (!ros || !isConnected) return;
-    if (points.length !== 4) {
-      alert("Lütfen 4 nokta seçin.");
-      return;
+  const onCanvasMouseDown = useCallback((e) => {
+    const canvas = canvasRef.current;
+    if (!canvas || !mapInfo) return;
+    const { canvasX, canvasY } = getCanvasPos(e, canvas);
+    const { wx, wy } = canvasToWorld(canvasX, canvasY);
+
+    if (activeMode === MODE_SELECT) {
+      setPoints(prev => prev.length >= 4 ? prev : [...prev, { x: wx, y: wy }]);
+    } else if (activeMode === MODE_GOALPOSE) {
+      goalDragRef.current = { worldX: wx, worldY: wy, canvasX, canvasY };
+      setGoalDragEnd({ canvasX, canvasY });
     }
+  }, [activeMode, mapInfo, canvasToWorld]);
+
+  const onCanvasMouseMove = useCallback((e) => {
+    if (activeMode !== MODE_GOALPOSE || !goalDragRef.current) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const { canvasX, canvasY } = getCanvasPos(e, canvas);
+    setGoalDragEnd({ canvasX, canvasY });
+  }, [activeMode]);
+
+  const onCanvasMouseUp = useCallback((e) => {
+    if (activeMode !== MODE_GOALPOSE || !goalDragRef.current) return;
+    const canvas = canvasRef.current;
+    if (!canvas || !mapInfo) return;
+    const { canvasX, canvasY } = getCanvasPos(e, canvas);
+    const { worldX: gx, worldY: gy, canvasX: sCX, canvasY: sCY } = goalDragRef.current;
+
+    // dx/dy in canvas space; flip y for world yaw
+    const dx =  (canvasX - sCX);
+    const dy = -(canvasY - sCY);
+    const yaw = Math.atan2(dy, dx);
+
+    publishGoalPose(gx, gy, yaw);
+    goalDragRef.current = null;
+    setGoalDragEnd(null);
+    setActiveMode(MODE_IDLE);
+  }, [activeMode, mapInfo, canvasToWorld]);
+
+  // ── Publish goal pose → /goal_pose ────────────────────────────────────────
+  const publishGoalPose = useCallback((wx, wy, yaw) => {
+    if (!ros || !isConnected) return;
+    try {
+      const topic = new ROSLIB.Topic({
+        ros, name: goalPoseTopic,
+        messageType: "geometry_msgs/msg/PoseStamped", queue_size: 1,
+      });
+      const q = yawToQuaternion(yaw);
+      topic.publish({
+        header: { frame_id: "map", stamp: { sec: Math.floor(Date.now() / 1000), nanosec: (Date.now() % 1000) * 1e6 } },
+        pose: { position: { x: wx, y: wy, z: 0.0 }, orientation: q },
+      });
+      setPageStatus(`✅ Goal Pose → (${wx.toFixed(2)}, ${wy.toFixed(2)}) θ:${(yaw * 180 / Math.PI).toFixed(1)}°`);
+      setPageError("");
+      setTimeout(() => { try { topic.unadvertise(); } catch {} }, 500);
+    } catch (err) {
+      setPageError(`Goal Pose hatası: ${prettyErr(err)}`);
+    }
+  }, [ros, isConnected]);
+
+  // ── Publish polygon ────────────────────────────────────────────────────────
+  const publishPolygon = useCallback(() => {
+    if (!ros || !isConnected || points.length !== 4) return;
+    try {
+      const topic = new ROSLIB.Topic({
+        ros, name: fieldPolyTopic,
+        messageType: "geometry_msgs/msg/PolygonStamped", queue_size: 1,
+      });
+      topic.publish({
+        header: { frame_id: "map", stamp: { sec: Math.floor(Date.now() / 1000), nanosec: (Date.now() % 1000) * 1e6 } },
+        polygon: { points: points.map(p => ({ x: p.x, y: p.y, z: 0.0 })) },
+      });
+      setPageStatus("✅ Polygon gönderildi — path hesaplanıp Nav2'ye otomatik gönderilecek");
+      setPageError("");
+      setExecStatus("sending");
+      setExecFeedback("CoverageExecutorNode bekliyor...");
+      setTimeout(() => { try { topic.unadvertise(); } catch {} }, 500);
+    } catch (err) {
+      setPageError(`Polygon hatası: ${prettyErr(err)}`);
+    }
+  }, [ros, isConnected, points]);
+
+  // ── Set params + recompute ─────────────────────────────────────────────────
+  const setParamAndRecompute = useCallback(() => {
+    if (!ros || !isConnected) return;
+    const setParam = (name, value) => new Promise((resolve, reject) => {
+      const srv = new ROSLIB.Service({
+        ros, name: "/coverage_planner_node/set_parameters",
+        serviceType: "rcl_interfaces/srv/SetParameters",
+      });
+      const valueObj =
+        typeof value === "string"        ? { type: 4, string_value: value }
+        : Number.isInteger(value)        ? { type: 2, integer_value: value }
+        :                                  { type: 3, double_value: value };
+      srv.callService({ parameters: [{ name, value: valueObj }] }, resolve, reject);
+    });
+
+    Promise.all([
+      setParam("style",           style),
+      setParam("line_spacing",    lineSpacing),
+      setParam("sweep_angle_deg", sweepAngle),
+      setParam("start_corner",    startCorner),
+    ])
+      .then(() => { setPageStatus("✅ Parametreler set edildi"); callRecompute(); })
+      .catch((err) => {
+        setPageError(`Param hatası: ${prettyErr(err)} — recompute deneniyor`);
+        callRecompute();
+      });
+  }, [ros, isConnected, style, lineSpacing, sweepAngle, startCorner]);
+
+  // ── Recompute ─────────────────────────────────────────────────────────────
+  const callRecompute = useCallback(() => {
+    if (!ros || !isConnected) return;
+    const srv = new ROSLIB.Service({ ros, name: recomputeSrvName, serviceType: "std_srvs/srv/Trigger" });
+    srv.callService({},
+      (res) => { if (res.success) { setPageStatus("✅ Path yeniden hesaplandı"); setPageError(""); } else setPageError(`Recompute: ${res.message}`); },
+      (err) => setPageError(`Recompute hatası: ${prettyErr(err)}`)
+    );
+  }, [ros, isConnected]);
+
+  // ── Execute path ──────────────────────────────────────────────────────────
+  // CoverageExecutorNode'un auto_execute:true ayarıyla /coverage/path'i republish ediyoruz.
+  // Bu republish → executor'un onPath() → Nav2 FollowPath action'ı tetikler.
+  const executePath = useCallback(() => {
+    if (!ros || !isConnected) { setPageError("ROS bağlı değil"); return; }
+    if (!pathMsg || pathMsg.poses.length < 2) { setPageError("Path yok — önce Polygon Gönder"); return; }
+
+    setExecStatus("sending");
+    setExecFeedback("Republish ediliyor...");
+    setPageError("");
 
     try {
       const topic = new ROSLIB.Topic({
-        ros,
-        name: fieldPolyTopic,
-        messageType: "geometry_msgs/msg/PolygonStamped",
-        queue_size: 1,
+        ros, name: pathTopicName, messageType: "nav_msgs/msg/Path", queue_size: 1,
       });
-
-      const msg = {
+      topic.publish({
         header: {
-          frame_id: "map",
-          stamp: { sec: Math.floor(Date.now() / 1000), nanosec: (Date.now() % 1000) * 1000000 }
+          frame_id: pathMsg.header?.frame_id || "map",
+          stamp: { sec: Math.floor(Date.now() / 1000), nanosec: (Date.now() % 1000) * 1e6 },
         },
-        polygon: {
-          points: points.map((p) => ({ x: p.x, y: p.y, z: 0.0 })),
-        },
-      };
-
-      topic.publish(msg);
-      setStatusText("✅ Polygon gönderildi (/coverage/field_polygon)");
-      setErrorText("");
-      
-      setTimeout(() => {
-        try {
-          topic.unadvertise();
-        } catch (e) {
-          console.warn("Topic unadvertise hatası:", e);
-        }
-      }, 500);
-    } catch (err) {
-      const errMsg = `Polygon gönderme hatası: ${prettyErr(err)}`;
-      setErrorText(errMsg);
-      console.error(errMsg, err);
-    }
-  };
-
-  // ---- Recompute çağrı ----
-  const callRecompute = () => {
-    if (!ros || !isConnected) return;
-
-    try {
-      const srv = new ROSLIB.Service({
-        ros,
-        name: recomputeSrvName,
-        serviceType: "std_srvs/srv/Trigger",
+        poses: pathMsg.poses,
       });
-
-      const req = {};
-
-      srv.callService(req, (res) => {
-        if (res.success) {
-          console.log("✅ Recompute başarılı");
-          setStatusText("🔄 Path yeniden hesaplandı");
-          setErrorText("");
-          
-          if (pathTopicRef.current) {
-            try {
-              pathTopicRef.current.unsubscribe();
-            } catch (e) {
-              console.warn("Unsubscribe hatası:", e);
-            }
-          }
-          
-          setTimeout(() => {
-            if (!ros || !isConnected) return;
-            
-            const newTopic = new ROSLIB.Topic({
-              ros,
-              name: pathTopicName,
-              messageType: "nav_msgs/msg/Path",
-              throttle_rate: 50,
-              queue_size: 1,
-            });
-
-            newTopic.subscribe((msg) => {
-              console.log(`📍 YENI Path alındı: ${msg.poses.length} poses`);
-              setPathMsg(msg);
-              setPathTimestamp(Date.now() / 1000);
-            });
-
-            pathTopicRef.current = newTopic;
-          }, 100);
-          
-        } else {
-          setErrorText(`Recompute başarısız: ${res.message}`);
-        }
-      }, (err) => {
-        const errMsg = `Recompute çağrısı hatası: ${prettyErr(err)}`;
-        setErrorText(errMsg);
-        console.error(errMsg, err);
-      });
+      setExecStatus("accepted");
+      setExecFeedback(`${pathMsg.poses.length} waypoint → CoverageExecutorNode → Nav2`);
+      setPageStatus("✅ Path Nav2 FollowPath action'a gönderildi");
+      setTimeout(() => { try { topic.unadvertise(); } catch {} }, 500);
     } catch (err) {
-      const errMsg = `Recompute çağrısı hatası: ${prettyErr(err)}`;
-      setErrorText(errMsg);
-      console.error(errMsg, err);
+      setExecStatus("error");
+      setPageError(`Execute hatası: ${prettyErr(err)}`);
     }
+  }, [ros, isConnected, pathMsg]);
+
+  const clearAll = () => {
+    setPoints([]); setPathMsg(null);
+    setExecStatus("idle"); setExecFeedback("");
+    goalDragRef.current = null; setGoalDragEnd(null);
+    setActiveMode(MODE_IDLE);
   };
 
-  // ---- Parametreleri uygula ----
-  const applyStyleParams = () => {
-    if (!ros || !isConnected) return;
+  // ── Cursor ─────────────────────────────────────────────────────────────────
+  const canvasCursor = activeMode === MODE_SELECT ? "crosshair" : activeMode === MODE_GOALPOSE ? "cell" : "default";
 
-    setStatusText("📋 Parametreler hazır. Terminal komutları clipboard'a kopyalandı.");
-    
-    const cmds = [
-      `ros2 param set /coverage_planner_node style ${style}`,
-      `ros2 param set /coverage_planner_node line_spacing ${lineSpacing}`,
-      `ros2 param set /coverage_planner_node sweep_angle_deg ${sweepAngle}`,
-      `ros2 param set /coverage_planner_node start_corner ${startCorner}`
-    ].join('\n');
-    
-    setErrorText(cmds);
-    
-    navigator.clipboard.writeText(cmds).then(() => {
-      console.log("✅ Komutlar clipboard'a kopyalandı");
-    }).catch(() => {
-      console.log("⚠️ Clipboard kopyalama başarısız");
-    });
-
-    setTimeout(() => {
-      callRecompute();
-    }, 3000);
+  const execBtnColor = { idle: "#334155", sending: "#d97706", accepted: "#2563eb", running: "#2563eb", done: "#10b981", error: "#ef4444" };
+  const execBtnLabel = {
+    idle:     "🚀 Path Çalıştır (Nav2)",
+    sending:  "⏳ Gönderiliyor...",
+    accepted: "✅ Nav2'ye Gönderildi",
+    running:  "🏃 Araç Hareket Ediyor",
+    done:     "✅ Tamamlandı",
+    error:    "❌ Hata — Tekrar Dene",
   };
 
-  // ---- Execute Path ----
-  const executePath = () => {
-    if (!ros || !isConnected) return;
-    if (!pathMsg || pathMsg.poses.length < 2) {
-      alert("Path yok. Önce Polygon gönderin ve Recompute yapın.");
-      return;
-    }
-
-    setIsExecuting(true);
-    setStatusText("⏳ Path Nav2'ye gönderiliyor...");
-
-    try {
-      setTimeout(() => {
-        setStatusText("🚀 Path executed (Nav2'ye gönderildi)");
-        setIsExecuting(false);
-      }, 1000);
-    } catch (err) {
-      setErrorText(`Execute hatası: ${prettyErr(err)}`);
-      setIsExecuting(false);
-    }
-  };
-
-  const clearSelection = () => {
-    setPoints([]);
-    setPathMsg(null);
-  };
-
+  // ── Render ─────────────────────────────────────────────────────────────────
   return (
-    <div style={{
-      minHeight: "calc(100vh - 56px)",
-      width: "100vw",
-      background: "linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #0f172a 100%)",
-      color: "white",
-      padding: "0.5rem",
-      fontFamily: "system-ui, -apple-system, sans-serif",
-      overflow: "hidden",
-      boxSizing: "border-box"
-    }}>
-      <div style={{
-        maxWidth: "1400px",
-        margin: "0 auto",
-        height: "100%",
-        display: "flex",
-        flexDirection: "column",
-        gap: "0.5rem"
-      }}>
-        {/* ====== HEADER ====== */}
-        <div style={{ flexShrink: 0 }}>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "0.5rem" }}>
-            <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
-              <span style={{ fontSize: "1.5rem" }}>🗺️</span>
-              <h1 style={{ fontSize: "1.125rem", fontWeight: "bold", margin: 0 }}>COVERAGE PLANNER</h1>
-            </div>
-            <button
-              onClick={() => setShowSettings(!showSettings)}
-              style={{
-                padding: "0.5rem 0.75rem",
-                borderRadius: "0.5rem",
-                background: "#334155",
-                border: "none",
-                color: "white",
-                cursor: "pointer",
-                fontSize: "0.875rem",
-                fontWeight: "500"
-              }}
-            >
-              ⚙️ {showSettings ? "Gizle" : "Ayarlar"}
-            </button>
+    <div style={{ minHeight: "calc(100vh - 56px)", width: "100vw", background: "#060d1a", color: "white", padding: "0.5rem", fontFamily: "'JetBrains Mono','Fira Code',monospace", overflow: "hidden", boxSizing: "border-box" }}>
+      <div style={{ maxWidth: "1600px", margin: "0 auto", height: "calc(100vh - 68px)", display: "flex", flexDirection: "column", gap: "0.4rem" }}>
+
+        {/* HEADER */}
+        <div style={{ flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "0.6rem" }}>
+            <span style={{ fontSize: "1.3rem" }}>🌾</span>
+            <h1 style={{ margin: 0, fontSize: "0.95rem", fontWeight: "800", letterSpacing: "0.15em", color: "#e2e8f0" }}>COVERAGE PLANNER</h1>
           </div>
-
-          {/* Status Bar */}
-          <div style={{ background: "#1e293b", borderRadius: "0.5rem", padding: "0.75rem", border: "1px solid #334155" }}>
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: "0.5rem" }}>
-              <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
-                <span style={{ fontSize: "1rem" }}>
-                  {isConnected ? "🟢" : "🔴"}
-                </span>
-                <div>
-                  <div style={{ fontWeight: "600", fontSize: "0.875rem" }}>{statusText}</div>
-                  {errorText && (
-                    <div style={{ fontSize: "0.75rem", color: "#f87171", marginTop: "0.125rem", whiteSpace: "pre-wrap" }}>{errorText}</div>
-                  )}
-                </div>
-              </div>
-
-              <div style={{ display: "flex", gap: "0.375rem" }}>
-                {!isConnected && (
-                  <button
-                    onClick={() => {
-                      const r = new ROSLIB.Ros({ url: wsUrl });
-                      setRos(r);
-                    }}
-                    style={{
-                      padding: "0.375rem 0.75rem",
-                      background: "#2563eb",
-                      border: "none",
-                      borderRadius: "0.375rem",
-                      color: "white",
-                      fontWeight: "600",
-                      cursor: "pointer",
-                      fontSize: "0.75rem"
-                    }}
-                  >
-                    🔗 Bağlan
-                  </button>
-                )}
-                {isConnected && (
-                  <button
-                    onClick={() => ros?.close()}
-                    style={{
-                      padding: "0.375rem 0.75rem",
-                      background: "#475569",
-                      border: "none",
-                      borderRadius: "0.375rem",
-                      color: "white",
-                      fontWeight: "600",
-                      cursor: "pointer",
-                      fontSize: "0.75rem"
-                    }}
-                  >
-                    ✂️ Kes
-                  </button>
-                )}
-              </div>
-            </div>
+          <div style={{ display: "flex", gap: "0.4rem", alignItems: "center" }}>
+            {!isConnected
+              ? <button onClick={reconnect} style={btnS("#2563eb")}>🔌 Bağlan</button>
+              : <span style={{ fontSize: "0.65rem", color: "#10b981", fontWeight: "700" }}>● ROS BAĞLI</span>}
+            <button onClick={() => setShowSettings(v => !v)} style={btnS("#1e293b", "1px solid #334155")}>⚙ Ayarlar</button>
           </div>
         </div>
 
-        {/* ====== SETTINGS PANEL ====== */}
+        {/* STATUS BAR */}
+        <div style={{ flexShrink: 0, background: "#0d1829", borderRadius: "0.3rem", padding: "0.4rem 0.75rem", border: `1px solid ${isConnected ? "#064e3b" : "#7f1d1d"}`, display: "flex", alignItems: "center", gap: "0.5rem", flexWrap: "wrap" }}>
+          <span style={{ color: isConnected ? "#10b981" : "#f87171", fontWeight: "700", fontSize: "0.65rem" }}>{isConnected ? "●" : "○"}</span>
+          <span style={{ fontSize: "0.7rem", color: "#94a3b8", flex: 1 }}>{displayStatus}</span>
+          {displayError && <span style={{ fontSize: "0.65rem", color: "#f87171" }}>⚠ {displayError}</span>}
+          {robotPose && (
+            <span style={{ fontSize: "0.65rem", color: "#facc15", fontWeight: "600", marginLeft: "auto" }}>
+              🤖 [{poseSource}] x:{robotPose.x.toFixed(2)} y:{robotPose.y.toFixed(2)} θ:{(robotPose.yaw * 180 / Math.PI).toFixed(1)}°
+            </span>
+          )}
+        </div>
+
+        {/* SETTINGS */}
         {showSettings && (
-          <div style={{
-            background: "#1e293b",
-            borderRadius: "0.5rem",
-            padding: "1rem",
-            border: "1px solid #334155",
-            flexShrink: 0,
-            maxHeight: "50vh",
-            overflowY: "auto"
-          }}>
-            <h2 style={{ fontSize: "1rem", fontWeight: "bold", marginBottom: "0.75rem", marginTop: 0 }}>
-              ⚙️ Ayarlar
-            </h2>
-
-            {/* Harita & ROS Ayarları */}
-            <div style={{ display: "grid", gridTemplateColumns: window.innerWidth < 768 ? "1fr" : "repeat(2, 1fr)", gap: "0.75rem", marginBottom: "1rem" }}>
-              <div>
-                <label style={{ display: "block", fontSize: "0.75rem", fontWeight: "600", marginBottom: "0.375rem", color: "#cbd5e1" }}>
-                  📍 Cartographer Map Topic
-                </label>
-                <input
-                  type="text"
-                  value={mapTopicName}
-                  onChange={(e) => {
-                    setPoints([]);
-                    setMapTopicName(e.target.value);
-                  }}
-                  placeholder="/map"
-                  style={{
-                    width: "100%",
-                    padding: "0.5rem",
-                    background: "#334155",
-                    border: "1px solid #475569",
-                    borderRadius: "0.375rem",
-                    color: "white",
-                    outline: "none",
-                    fontSize: "0.875rem"
-                  }}
-                />
-              </div>
-
-              <div>
-                <label style={{ display: "block", fontSize: "0.75rem", fontWeight: "600", marginBottom: "0.375rem", color: "#cbd5e1" }}>
-                  🌐 ROSBridge WebSocket URL
-                </label>
-                <input
-                  type="text"
-                  value={wsUrl}
-                  onChange={(e) => setWsUrl(e.target.value)}
-                  placeholder="ws://localhost:9090"
-                  style={{
-                    width: "100%",
-                    padding: "0.5rem",
-                    background: "#334155",
-                    border: "1px solid #475569",
-                    borderRadius: "0.375rem",
-                    color: "white",
-                    outline: "none",
-                    fontSize: "0.875rem"
-                  }}
-                />
-              </div>
+          <div style={{ flexShrink: 0, background: "#0d1829", borderRadius: "0.4rem", padding: "0.75rem", border: "1px solid #1e3a5f", display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px,1fr))", gap: "0.6rem" }}>
+            <div><div style={lblS}>MAP TOPIC</div><input type="text" value={mapTopicName} onChange={e => setMapTopicName(e.target.value)} style={inpS} /></div>
+            <div><div style={lblS}>STİL</div>
+              <select value={style} onChange={e => setStyle(e.target.value)} style={inpS}>
+                <option value="zigzag">↔ Zigzag</option>
+                <option value="ladder">↕ Ladder</option>
+                <option value="diagonal">↗ Diagonal</option>
+              </select>
             </div>
-
-            <hr style={{ borderColor: "#334155", margin: "0.75rem 0" }} />
-
-            {/* Path Stili Ayarları */}
-            <h3 style={{ fontSize: "0.875rem", fontWeight: "700", marginBottom: "0.75rem", marginTop: 0 }}>
-              📐 Path Stili Parametreleri
-            </h3>
-
-            <div style={{ display: "grid", gridTemplateColumns: window.innerWidth < 768 ? "1fr" : "repeat(4, 1fr)", gap: "0.75rem", marginBottom: "1rem" }}>
-              <div>
-                <label style={{ display: "block", fontSize: "0.75rem", fontWeight: "500", marginBottom: "0.375rem", color: "#cbd5e1" }}>
-                  Stil
-                </label>
-                <select
-                  value={style}
-                  onChange={(e) => setStyle(e.target.value)}
-                  style={{
-                    width: "100%",
-                    padding: "0.5rem",
-                    background: "#334155",
-                    border: "1px solid #475569",
-                    borderRadius: "0.375rem",
-                    color: "white",
-                    outline: "none",
-                    fontSize: "0.875rem"
-                  }}
-                >
-                  <option value="zigzag">↔️ Zigzag (Yatay)</option>
-                  <option value="ladder">↕️ Ladder (Dikey)</option>
-                  <option value="diagonal">⟍ Diagonal</option>
-                </select>
-              </div>
-
-              <div>
-                <label style={{ display: "block", fontSize: "0.75rem", fontWeight: "500", marginBottom: "0.375rem", color: "#cbd5e1" }}>
-                  Satır Aralığı (m)
-                </label>
-                <input
-                  type="number"
-                  min="0.2"
-                  max="2.0"
-                  step="0.1"
-                  value={lineSpacing}
-                  onChange={(e) => setLineSpacing(Number(e.target.value))}
-                  style={{
-                    width: "100%",
-                    padding: "0.5rem",
-                    background: "#334155",
-                    border: "1px solid #475569",
-                    borderRadius: "0.375rem",
-                    color: "white",
-                    outline: "none",
-                    fontSize: "0.875rem"
-                  }}
-                />
-              </div>
-
-              <div>
-                <label style={{ display: "block", fontSize: "0.75rem", fontWeight: "500", marginBottom: "0.375rem", color: "#cbd5e1" }}>
-                  Sweep Açısı (°)
-                </label>
-                <input
-                  type="number"
-                  min="0"
-                  max="180"
-                  step="5"
-                  value={sweepAngle}
-                  onChange={(e) => setSweepAngle(Number(e.target.value))}
-                  style={{
-                    width: "100%",
-                    padding: "0.5rem",
-                    background: "#334155",
-                    border: "1px solid #475569",
-                    borderRadius: "0.375rem",
-                    color: "white",
-                    outline: "none",
-                    fontSize: "0.875rem"
-                  }}
-                />
-              </div>
-
-              <div>
-                <label style={{ display: "block", fontSize: "0.75rem", fontWeight: "500", marginBottom: "0.375rem", color: "#cbd5e1" }}>
-                  Başlama Köşesi
-                </label>
-                <select
-                  value={startCorner}
-                  onChange={(e) => setStartCorner(Number(e.target.value))}
-                  style={{
-                    width: "100%",
-                    padding: "0.5rem",
-                    background: "#334155",
-                    border: "1px solid #475569",
-                    borderRadius: "0.375rem",
-                    color: "white",
-                    outline: "none",
-                    fontSize: "0.875rem"
-                  }}
-                >
-                  {[0, 1, 2, 3].map((v) => (
-                    <option key={v} value={v}>Köşe #{v + 1}</option>
-                  ))}
-                </select>
-              </div>
+            <div><div style={lblS}>ARALIK (m)</div><input type="number" min="0.1" max="3" step="0.1" value={lineSpacing} onChange={e => setLineSpacing(Number(e.target.value))} style={inpS} /></div>
+            <div><div style={lblS}>SWEEP (°)</div><input type="number" min="0" max="180" step="5" value={sweepAngle} onChange={e => setSweepAngle(Number(e.target.value))} style={inpS} /></div>
+            <div><div style={lblS}>BAŞLANGIÇ KÖŞESİ</div>
+              <select value={startCorner} onChange={e => setStartCorner(Number(e.target.value))} style={inpS}>
+                {[0,1,2,3].map(v => <option key={v} value={v}>Köşe {v+1}</option>)}
+              </select>
             </div>
-
-            {/* Preview Toggle */}
-            <div style={{ 
-              display: "flex", 
-              alignItems: "center", 
-              gap: "0.5rem", 
-              marginBottom: "1rem",
-              padding: "0.75rem",
-              background: "#0f172a",
-              borderRadius: "0.375rem",
-              border: "1px solid #334155"
-            }}>
-              <input
-                type="checkbox"
-                id="showPreview"
-                checked={showPreview}
-                onChange={(e) => setShowPreview(e.target.checked)}
-                style={{ width: "18px", height: "18px", cursor: "pointer" }}
-              />
-              <label htmlFor="showPreview" style={{ fontSize: "0.875rem", cursor: "pointer", color: "#cbd5e1" }}>
-                🔵 Frontend Preview Göster (seçilen stil ve parametrelerle)
+            <div style={{ display: "flex", flexDirection: "column", gap: "0.4rem", justifyContent: "flex-end" }}>
+              <button onClick={setParamAndRecompute} disabled={!isConnected} style={btnS(isConnected ? "#1d4ed8" : "#1e293b")}>📤 Uygula + Recompute</button>
+              <label style={{ display: "flex", alignItems: "center", gap: "0.4rem", fontSize: "0.65rem", color: "#94a3b8", cursor: "pointer" }}>
+                <input type="checkbox" checked={showPreview} onChange={e => setShowPreview(e.target.checked)} /> Preview
               </label>
-            </div>
-
-            {/* Action Buttons */}
-            <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.75rem" }}>
-              <button
-                onClick={applyStyleParams}
-                disabled={!isConnected}
-                style={{
-                  flex: 1,
-                  padding: "0.75rem",
-                  background: isConnected ? "#2563eb" : "#334155",
-                  border: "none",
-                  borderRadius: "0.375rem",
-                  color: "white",
-                  fontWeight: "700",
-                  cursor: isConnected ? "pointer" : "not-allowed",
-                  fontSize: "0.875rem",
-                  opacity: isConnected ? 1 : 0.5
-                }}
-              >
-                📋 Parametreleri Uygula (ROS)
-              </button>
-              <button
-                onClick={callRecompute}
-                disabled={!isConnected}
-                style={{
-                  flex: 1,
-                  padding: "0.75rem",
-                  background: isConnected ? "#10b981" : "#334155",
-                  border: "none",
-                  borderRadius: "0.375rem",
-                  color: "white",
-                  fontWeight: "700",
-                  cursor: isConnected ? "pointer" : "not-allowed",
-                  fontSize: "0.875rem",
-                  opacity: isConnected ? 1 : 0.5
-                }}
-              >
-                🔄 Recompute
-              </button>
-            </div>
-
-            {/* Stil Gösterimi */}
-            <div style={{
-              display: "grid",
-              gridTemplateColumns: "repeat(3, 1fr)",
-              gap: "0.5rem",
-              marginTop: "0.75rem"
-            }}>
-              {[
-                { name: "zigzag", label: "Zigzag", icon: "↔️", desc: "Yatay çizgiler" },
-                { name: "ladder", label: "Ladder", icon: "↕️", desc: "Dikey çizgiler" },
-                { name: "diagonal", label: "Diagonal", icon: "⟍", desc: "Açılı çizgiler" }
-              ].map((s) => (
-                <div
-                  key={s.name}
-                  onClick={() => setStyle(s.name)}
-                  style={{
-                    padding: "0.75rem",
-                    background: style === s.name ? "#1e40af" : "#0f172a",
-                    border: style === s.name ? "2px solid #3b82f6" : "1px solid #334155",
-                    borderRadius: "0.5rem",
-                    cursor: "pointer",
-                    textAlign: "center",
-                    transition: "all 0.2s"
-                  }}
-                >
-                  <div style={{ fontSize: "1.5rem", marginBottom: "0.25rem" }}>{s.icon}</div>
-                  <div style={{ fontSize: "0.8rem", fontWeight: "600", color: "#cbd5e1" }}>{s.label}</div>
-                  <div style={{ fontSize: "0.65rem", color: "#94a3b8" }}>{s.desc}</div>
-                </div>
-              ))}
             </div>
           </div>
         )}
 
-        {/* ====== MAIN CONTENT ====== */}
-        <div style={{
-          flex: 1,
-          display: "grid",
-          gridTemplateColumns: window.innerWidth < 768 ? "1fr" : "320px 1fr",
-          gap: "0.75rem",
-          minHeight: 0
-        }}>
-          {/* ====== SOL PANEL: KONTROLLER ====== */}
-          <div style={{
-            background: "#1e293b",
-            borderRadius: "0.5rem",
-            padding: "1rem",
-            border: "1px solid #334155",
-            display: "flex",
-            flexDirection: "column",
-            overflow: "auto"
-          }}>
-            <h2 style={{ fontSize: "0.95rem", fontWeight: "bold", marginBottom: "1rem", marginTop: 0 }}>
-              🎯 Nokta Seçimi
-            </h2>
+        {/* MAIN */}
+        <div style={{ flex: 1, display: "grid", gridTemplateColumns: "260px 1fr", gap: "0.4rem", minHeight: 0 }}>
 
-            {/* Kontrol Butonları */}
-            <div style={{ display: "flex", gap: "0.5rem", marginBottom: "1rem" }}>
-              <button
-                onClick={() => setSelectMode((v) => !v)}
-                style={{
-                  flex: 1,
-                  padding: "0.75rem",
-                  background: selectMode ? "#2563eb" : "#334155",
-                  border: "none",
-                  borderRadius: "0.375rem",
-                  color: "white",
-                  fontWeight: "700",
-                  cursor: "pointer",
-                  fontSize: "0.75rem"
-                }}
-              >
-                {selectMode ? "✓ SEÇİM AÇIK" : "○ SEÇİM KAPALI"}
-              </button>
-              <button
-                onClick={clearSelection}
-                style={{
-                  flex: 1,
-                  padding: "0.75rem",
-                  background: "#334155",
-                  border: "none",
-                  borderRadius: "0.375rem",
-                  color: "white",
-                  fontWeight: "600",
-                  cursor: "pointer",
-                  fontSize: "0.75rem"
-                }}
-              >
-                🗑️ Temizle
-              </button>
-            </div>
+          {/* LEFT */}
+          <div style={{ background: "#0d1829", borderRadius: "0.4rem", padding: "0.75rem", border: "1px solid #162032", display: "flex", flexDirection: "column", gap: "0.5rem", overflow: "auto" }}>
 
-            {/* Stil Seçimi (Hızlı Erişim) */}
-            <div style={{ background: "#0f172a", borderRadius: "0.375rem", padding: "0.75rem", marginBottom: "1rem", border: "1px solid #334155" }}>
-              <div style={{ fontWeight: "700", marginBottom: "0.5rem", fontSize: "0.85rem", color: "#cbd5e1" }}>
-                📐 Path Stili
-              </div>
-              <div style={{ display: "flex", gap: "0.375rem" }}>
-                {[
-                  { name: "zigzag", icon: "↔️" },
-                  { name: "ladder", icon: "↕️" },
-                  { name: "diagonal", icon: "⟍" }
-                ].map((s) => (
-                  <button
-                    key={s.name}
-                    onClick={() => setStyle(s.name)}
-                    style={{
-                      flex: 1,
-                      padding: "0.5rem",
-                      background: style === s.name ? "#2563eb" : "#334155",
-                      border: style === s.name ? "2px solid #60a5fa" : "1px solid #475569",
-                      borderRadius: "0.375rem",
-                      color: "white",
-                      cursor: "pointer",
-                      fontSize: "0.75rem",
-                      fontWeight: style === s.name ? "700" : "500"
-                    }}
-                  >
-                    {s.icon} {s.name}
+            {/* Style */}
+            <div>
+              <div style={lblS}>PATH STİLİ</div>
+              <div style={{ display: "flex", gap: "0.3rem" }}>
+                {[{n:"zigzag",i:"↔"},{n:"ladder",i:"↕"},{n:"diagonal",i:"↗"}].map(s => (
+                  <button key={s.n} onClick={() => setStyle(s.n)}
+                    style={{ flex: 1, padding: "0.4rem 0.15rem", background: style===s.n?"#1d4ed8":"#162032", border: style===s.n?"1px solid #3b82f6":"1px solid #1e293b", borderRadius: "0.25rem", color: "white", cursor: "pointer", fontSize: "0.6rem", fontWeight: style===s.n?"700":"400" }}>
+                    {s.i} {s.n}
                   </button>
                 ))}
               </div>
             </div>
 
-            {/* Harita Bilgisi */}
-            <div style={{ background: "#0f172a", borderRadius: "0.375rem", padding: "0.75rem", marginBottom: "1rem", border: "1px solid #334155" }}>
-              <div style={{ fontWeight: "700", marginBottom: "0.5rem", fontSize: "0.85rem", color: "#cbd5e1" }}>
-                📊 Harita Bilgisi
-              </div>
-              {mapInfo ? (
-                <div style={{ fontSize: "0.75rem", color: "#cbd5e1", lineHeight: "1.6" }}>
-                  <div><span style={{ color: "#94a3b8" }}>Boyut:</span> {mapInfo.width}×{mapInfo.height}px</div>
-                  <div><span style={{ color: "#94a3b8" }}>Rez.:</span> {mapInfo.resolution.toFixed(3)}m</div>
-                  <div><span style={{ color: "#94a3b8" }}>Menşei:</span> ({mapInfo.originX.toFixed(1)}, {mapInfo.originY.toFixed(1)})</div>
-                </div>
-              ) : mapLoading ? (
-                <div style={{ fontSize: "0.75rem", color: "#fbbf24" }}>⏳ Harita bekleniyor...</div>
-              ) : (
-                <div style={{ fontSize: "0.75rem", color: "#f87171" }}>❌ Harita bağlantısı yok</div>
-              )}
-            </div>
+            <div style={{ borderTop: "1px solid #162032" }} />
 
-            {/* Seçilen Noktalar */}
-            <div style={{ background: "#0f172a", borderRadius: "0.375rem", padding: "0.75rem", marginBottom: "1rem", border: "1px solid #334155" }}>
-              <div style={{ fontWeight: "700", marginBottom: "0.5rem", fontSize: "0.85rem", color: "#cbd5e1" }}>
-                📌 Noktalar: <span style={{ color: "#60a5fa" }}>{points.length}</span>/4
-              </div>
-              {points.length > 0 ? (
-                <ol style={{ margin: 0, paddingLeft: "1.5rem", fontSize: "0.7rem", color: "#cbd5e1", lineHeight: "1.8" }}>
-                  {points.map((p, idx) => (
-                    <li key={idx} style={{ marginBottom: "0.25rem" }}>
-                      <code style={{ color: idx === startCorner ? "#22c55e" : "#60a5fa", fontSize: "0.65rem" }}>
-                        ({p.x.toFixed(1)}, {p.y.toFixed(1)}) {idx === startCorner && "← Başlangıç"}
-                      </code>
-                    </li>
-                  ))}
-                </ol>
-              ) : (
-                <div style={{ fontSize: "0.75rem", color: "#64748b" }}>Henüz nokta seçilmedi</div>
-              )}
-            </div>
+            {/* Modes */}
+            <div>
+              <div style={lblS}>MOD SEÇ</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: "0.3rem" }}>
 
-            {/* Preview Info */}
-            {showPreview && points.length === 4 && (
-              <div style={{ background: "#1e3a5f", borderRadius: "0.375rem", padding: "0.75rem", marginBottom: "1rem", border: "1px solid #3b82f6" }}>
-                <div style={{ fontWeight: "700", marginBottom: "0.25rem", fontSize: "0.8rem", color: "#93c5fd" }}>
-                  🔵 Preview Aktif
-                </div>
-                <div style={{ fontSize: "0.7rem", color: "#bfdbfe" }}>
-                  Stil: <strong>{style}</strong> | Aralık: <strong>{lineSpacing}m</strong>
-                </div>
-                <div style={{ fontSize: "0.65rem", color: "#93c5fd", marginTop: "0.25rem" }}>
-                  {previewPath.length} noktalı path gösteriliyor
-                </div>
-              </div>
-            )}
+                {/* Polygon select mode */}
+                <button onClick={() => setActiveMode(m => m === MODE_SELECT ? MODE_IDLE : MODE_SELECT)}
+                  style={{ padding: "0.55rem 0.5rem", textAlign: "left", background: activeMode===MODE_SELECT?"rgba(249,115,22,0.12)":"#162032", border: `1px solid ${activeMode===MODE_SELECT?"#f97316":"#1e293b"}`, borderRadius: "0.3rem", color: activeMode===MODE_SELECT?"#f97316":"#94a3b8", cursor: "pointer", fontSize: "0.7rem", fontWeight: "700" }}>
+                  {activeMode===MODE_SELECT?"✅":"⬜"} Alan Seçimi ({points.length}/4)
+                </button>
 
-            {/* Action Buttons */}
-            <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
-              <button
-                onClick={publishPolygon}
-                disabled={points.length !== 4 || !isConnected}
-                style={{
-                  padding: "0.85rem",
-                  background: points.length === 4 && isConnected ? "#10b981" : "#334155",
-                  border: "none",
-                  borderRadius: "0.375rem",
-                  color: "white",
-                  fontWeight: "700",
-                  cursor: points.length === 4 && isConnected ? "pointer" : "not-allowed",
-                  fontSize: "0.875rem",
-                  opacity: points.length === 4 && isConnected ? 1 : 0.5
-                }}
-              >
-                📤 Polygon Gönder
-              </button>
+                {/* 2D Nav Goal mode */}
+                <button onClick={() => {
+                    if (!isConnected) { setPageError("Önce ROS'a bağlanın"); return; }
+                    setActiveMode(m => m === MODE_GOALPOSE ? MODE_IDLE : MODE_GOALPOSE);
+                    goalDragRef.current = null; setGoalDragEnd(null);
+                  }}
+                  style={{ padding: "0.55rem 0.5rem", textAlign: "left", background: activeMode===MODE_GOALPOSE?"rgba(168,85,247,0.12)":"#162032", border: `1px solid ${activeMode===MODE_GOALPOSE?"#a855f7":"#1e293b"}`, borderRadius: "0.3rem", color: activeMode===MODE_GOALPOSE?"#c084fc":"#94a3b8", cursor: "pointer", fontSize: "0.7rem", fontWeight: "700" }}>
+                  {activeMode===MODE_GOALPOSE?"🟣":"⬜"} 2D Nav Goal (RViz gibi)
+                </button>
 
-              <button
-                onClick={executePath}
-                disabled={!pathMsg || pathMsg.poses.length < 2 || isExecuting}
-                style={{
-                  padding: "0.85rem",
-                  background: pathMsg?.poses?.length > 1 ? "#f59e0b" : "#334155",
-                  border: "none",
-                  borderRadius: "0.375rem",
-                  color: "white",
-                  fontWeight: "700",
-                  cursor: pathMsg?.poses?.length > 1 ? "pointer" : "not-allowed",
-                  fontSize: "0.875rem",
-                  opacity: pathMsg?.poses?.length > 1 ? 1 : 0.5
-                }}
-              >
-                🚀 {isExecuting ? "Çalıştırılıyor..." : "Path Çalıştır (Nav2)"}
-              </button>
-            </div>
-
-            <hr style={{ borderColor: "#334155", margin: "0.75rem 0" }} />
-
-            {/* Rehber */}
-            <div style={{ fontSize: "0.7rem", color: "#94a3b8", lineHeight: "1.6" }}>
-              <div style={{ fontWeight: "700", marginBottom: "0.5rem", color: "#cbd5e1" }}>💡 Akış:</div>
-              <ol style={{ margin: 0, paddingLeft: "1.25rem" }}>
-                <li>Stil seç (zigzag/ladder)</li>
-                <li>4 nokta seç (preview görünür)</li>
-                <li>"Polygon Gönder"</li>
-                <li>"Path Çalıştır"</li>
-              </ol>
-            </div>
-          </div>
-
-          {/* ====== SAĞ PANEL: HARITA ====== */}
-          <div style={{
-            background: "#1e293b",
-            borderRadius: "0.5rem",
-            padding: "1rem",
-            border: "1px solid #334155",
-            display: "flex",
-            flexDirection: "column",
-            overflow: "hidden"
-          }}>
-            <h2 style={{ fontSize: "0.95rem", fontWeight: "bold", marginBottom: "0.75rem", marginTop: 0, flexShrink: 0 }}>
-              🗺️ Cartographer Haritası
-            </h2>
-
-            {/* Harita Canvas */}
-            <div style={{
-              flex: 1,
-              borderRadius: "0.5rem",
-              border: "2px solid #475569",
-              overflow: "hidden",
-              background: "#0a0f1a",
-              position: "relative",
-              minHeight: 0,
-              display: "flex",
-              flexDirection: "column"
-            }}>
-              <div
-                ref={containerRef}
-                style={{
-                  position: "relative",
-                  flex: 1,
-                  display: "flex",
-                  flexDirection: "column",
-                  minHeight: 0
-                }}
-              >
-                {/* Status Bar */}
-                <div style={{
-                  display: "flex",
-                  justifyContent: "space-between",
-                  alignItems: "center",
-                  fontSize: "0.7rem",
-                  color: "#94a3b8",
-                  marginBottom: "0.5rem",
-                  flexShrink: 0,
-                  flexWrap: "wrap",
-                  gap: "0.5rem",
-                  background: "rgba(15, 23, 42, 0.9)",
-                  padding: "0.35rem 0.5rem",
-                  borderRadius: "0.25rem"
-                }}>
-                  <div style={{ display: "flex", gap: "0.75rem", alignItems: "center" }}>
-                    <span>{selectMode ? "✓ Seçim AKTİF" : "○ Seçim KAPALI"}</span>
-                    <span style={{ color: "#f97316" }}>📐 {style}</span>
-                  </div>
-                  <div style={{ display: "flex", gap: "0.75rem" }}>
-                    {mapInfo && (
-                      <span style={{ color: "#60a5fa" }}>📊 {mapInfo.width}×{mapInfo.height}</span>
-                    )}
-                    {showPreview && previewPath.length > 0 && (
-                      <span style={{ color: "#3b82f6" }}>🔵 Preview: {previewPath.length} pts</span>
-                    )}
-                    {pathMsg?.poses?.length > 0 && (
-                      <span style={{ color: "#10b981" }}>🟢 ROS: {pathMsg.poses.length} poses</span>
-                    )}
-                  </div>
-                </div>
-
-                {/* Canvas */}
-                {mapImageData ? (
-                  <canvas
-                    ref={canvasRef}
-                    onClick={onCanvasClick}
-                    style={{
-                      flex: 1,
-                      border: "1px solid #334155",
-                      borderRadius: "0.375rem",
-                      cursor: selectMode ? "crosshair" : "default",
-                      width: "100%",
-                      height: "100%",
-                      objectFit: "contain",
-                      backgroundColor: "#0a0f1a",
-                      display: "block"
-                    }}
-                  />
-                ) : (
-                  <div style={{
-                    flex: 1,
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    color: "#64748b",
-                    textAlign: "center"
-                  }}>
-                    <div>
-                      <div style={{ fontSize: "3rem", marginBottom: "0.75rem" }}>🗺️</div>
-                      <div style={{ fontSize: "0.95rem", fontWeight: "600", marginBottom: "0.5rem", color: "#cbd5e1" }}>
-                        {mapLoading ? "Harita Yükleniyor..." : "Bağlantı Bekleniyor"}
-                      </div>
-                      <div style={{ fontSize: "0.75rem", color: "#475569" }}>
-                        Topic: <code style={{ color: "#60a5fa" }}>{mapTopicName}</code>
-                      </div>
-                    </div>
+                {activeMode === MODE_GOALPOSE && (
+                  <div style={{ padding: "0.4rem", background: "rgba(168,85,247,0.07)", border: "1px solid #6b21a8", borderRadius: "0.25rem", fontSize: "0.6rem", color: "#c4b5fd", lineHeight: "1.7" }}>
+                    📍 Haritada <b>tıkla</b> = konum<br/>
+                    🔄 <b>Sürükle</b> = yön<br/>
+                    🖱 <b>Bırak</b> = /goal_pose gönder
                   </div>
                 )}
               </div>
             </div>
 
-            {/* Legend */}
-            <div style={{
-              marginTop: "0.5rem",
-              fontSize: "0.7rem",
-              color: "#94a3b8",
-              display: "flex",
-              gap: "1rem",
-              flexWrap: "wrap",
-              justifyContent: "center"
-            }}>
-              <div>🟠 <span style={{ color: "#f97316" }}>Seçim Alanı</span></div>
-              <div>🔵 <span style={{ color: "#3b82f6" }}>Preview Path</span></div>
-              <div>🟢 <span style={{ color: "#10b981" }}>ROS Path</span></div>
-              <div>🟢 S = <span style={{ color: "#22c55e" }}>Başlangıç</span></div>
-              <div>🔴 E = <span style={{ color: "#ef4444" }}>Bitiş</span></div>
+            <div style={{ borderTop: "1px solid #162032" }} />
+
+            {/* Points */}
+            <div style={crdS}>
+              <div style={lblS}>NOKTALAR <span style={{ color: points.length===4?"#10b981":"#f97316" }}>{points.length}/4</span></div>
+              {points.length === 0
+                ? <div style={{ fontSize: "0.6rem", color: "#1e293b" }}>Alan seçim modunda haritaya tıkla</div>
+                : points.map((p, i) => (
+                  <div key={i} style={{ fontSize: "0.6rem", color: i===startCorner?"#22c55e":"#60a5fa", lineHeight: "1.8" }}>
+                    {i+1}: ({p.x.toFixed(2)}, {p.y.toFixed(2)}) {i===startCorner?"⭐":""}
+                  </div>
+                ))
+              }
+            </div>
+
+            {/* Robot */}
+            <div style={crdS}>
+              <div style={lblS}>ROBOT POZİSYONU</div>
+              {robotPose
+                ? <div style={{ fontSize: "0.65rem", color: "#facc15", lineHeight: "1.7" }}>
+                    <div>x: {robotPose.x.toFixed(3)} m</div>
+                    <div>y: {robotPose.y.toFixed(3)} m</div>
+                    <div>θ: {(robotPose.yaw * 180 / Math.PI).toFixed(1)}°</div>
+                    <div style={{ color: "#475569", fontSize: "0.55rem" }}>src: {poseSource}</div>
+                  </div>
+                : <div style={{ fontSize: "0.6rem", color: "#334155" }}>
+                    Pose alınamadı<br/>
+                    <span style={{ color: "#1e293b" }}>/amcl_pose | /odom</span>
+                  </div>
+              }
+            </div>
+
+            {/* Path info */}
+            {pathMsg?.poses?.length > 0 && (
+              <div style={{ ...crdS, border: "1px solid #064e3b" }}>
+                <div style={lblS}>AKTİF PATH</div>
+                <div style={{ fontSize: "0.65rem", color: "#10b981" }}>{pathMsg.poses.length} waypoint</div>
+                <div style={{ fontSize: "0.55rem", color: "#475569" }}>frame: {pathMsg.header?.frame_id||"?"}</div>
+                {execFeedback && <div style={{ fontSize: "0.55rem", color: "#60a5fa", marginTop: "0.15rem" }}>{execFeedback}</div>}
+              </div>
+            )}
+
+            <div style={{ flex: 1 }} />
+
+            {/* Buttons */}
+            <div style={{ display: "flex", flexDirection: "column", gap: "0.35rem" }}>
+              <button onClick={publishPolygon} disabled={points.length!==4||!isConnected}
+                style={{ ...btnS(points.length===4&&isConnected?"#065f46":"#162032"), padding: "0.7rem", fontSize: "0.75rem", opacity: points.length===4&&isConnected?1:0.4 }}>
+                📤 Polygon Gönder
+              </button>
+              <button onClick={executePath} disabled={!pathMsg||pathMsg.poses.length<2||!isConnected}
+                style={{ ...btnS(execBtnColor[execStatus]), padding: "0.7rem", fontSize: "0.75rem", fontWeight: "800", opacity: pathMsg?.poses?.length>1&&isConnected?1:0.4, transition: "background 0.3s" }}>
+                {execBtnLabel[execStatus]}
+              </button>
+              <button onClick={clearAll}
+                style={{ ...btnS("transparent","1px solid #1e293b"), padding: "0.4rem", fontSize: "0.65rem", color: "#475569" }}>
+                🗑 Temizle
+              </button>
+            </div>
+
+            {/* Flow guide */}
+            <div style={{ fontSize: "0.55rem", color: "#334155", lineHeight: "1.9", borderTop: "1px solid #162032", paddingTop: "0.4rem" }}>
+              <div style={{ color: "#475569", fontWeight: "700" }}>COVERAGE AKIŞI:</div>
+              <div>1 → Stil seç</div>
+              <div>2 → Alan Seçimi (4 nokta)</div>
+              <div>3 → Polygon Gönder</div>
+              <div>4 → Path Çalıştır</div>
+              <div style={{ marginTop: "0.3rem", color: "#334155" }}>TEK HEDEF: 2D Nav Goal</div>
             </div>
           </div>
-        </div>
 
-        {/* ====== FOOTER ====== */}
-        <div style={{
-          textAlign: "center",
-          fontSize: "0.65rem",
-          color: "#64748b",
-          flexShrink: 0,
-          borderTop: "1px solid #334155",
-          paddingTop: "0.5rem"
-        }}>
-          <div>🗺️ Coverage Planner | ROS 2 + Nav2 | Frontend Preview Enabled</div>
+          {/* MAP */}
+          <div style={{ background: "#0d1829", borderRadius: "0.4rem", padding: "0.75rem", border: "1px solid #162032", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "0.4rem", flexShrink: 0, flexWrap: "wrap", gap: "0.3rem" }}>
+              <span style={{ fontSize: "0.7rem", fontWeight: "700", color: "#e2e8f0", letterSpacing: "0.1em" }}>🗺 HARİTA</span>
+              <div style={{ display: "flex", gap: "0.6rem", fontSize: "0.58rem" }}>
+                <span style={{ color: "#f97316" }}>🟠 Alan</span>
+                <span style={{ color: "#3b82f6" }}>🔵 Preview</span>
+                <span style={{ color: "#10b981" }}>🟢 ROS Path</span>
+                <span style={{ color: "#facc15" }}>🟡 Robot</span>
+                <span style={{ color: "#a855f7" }}>🟣 Goal</span>
+                <span style={{ color: "#22c55e" }}>● S</span>
+                <span style={{ color: "#ef4444" }}>● E</span>
+              </div>
+            </div>
+
+            <div ref={containerRef} style={{ flex: 1, background: "#040810", borderRadius: "0.3rem", border: "1px solid #162032", overflow: "hidden", position: "relative", display: "flex", alignItems: "center", justifyContent: "center", minHeight: 0 }}>
+              {mapImageData ? (
+                <canvas
+                  ref={canvasRef}
+                  onMouseDown={onCanvasMouseDown}
+                  onMouseMove={onCanvasMouseMove}
+                  onMouseUp={onCanvasMouseUp}
+                  onMouseLeave={() => { if (activeMode===MODE_GOALPOSE) { goalDragRef.current=null; setGoalDragEnd(null); }}}
+                  style={{ cursor: canvasCursor, display: "block", maxWidth: "100%", maxHeight: "100%" }}
+                />
+              ) : (
+                <div style={{ textAlign: "center" }}>
+                  <div style={{ fontSize: "3rem", marginBottom: "0.5rem" }}>🗺</div>
+                  <div style={{ fontSize: "0.8rem", color: "#1e293b" }}>{mapLoading ? "Yükleniyor..." : "Bağlantı bekleniyor"}</div>
+                  <div style={{ fontSize: "0.65rem", color: "#162032", marginTop: "0.2rem" }}>{mapTopicName}</div>
+                </div>
+              )}
+
+              {mapInfo && (
+                <div style={{ position: "absolute", bottom: 5, right: 7, fontSize: "0.55rem", color: "#1e293b" }}>
+                  {mapInfo.width}×{mapInfo.height} · {mapInfo.resolution.toFixed(3)}m/px
+                </div>
+              )}
+              {activeMode === MODE_SELECT && (
+                <div style={{ position: "absolute", top: 6, left: 6, background: "rgba(249,115,22,0.1)", border: "1px solid #f97316", borderRadius: "0.2rem", padding: "0.2rem 0.45rem", fontSize: "0.6rem", color: "#fb923c", fontWeight: "700" }}>
+                  ✚ ALAN SEÇİMİ ({points.length}/4)
+                </div>
+              )}
+              {activeMode === MODE_GOALPOSE && (
+                <div style={{ position: "absolute", top: 6, left: 6, background: "rgba(168,85,247,0.1)", border: "1px solid #a855f7", borderRadius: "0.2rem", padding: "0.2rem 0.45rem", fontSize: "0.6rem", color: "#c084fc", fontWeight: "700" }}>
+                  🎯 2D NAV GOAL — Tıkla + Sürükle
+                </div>
+              )}
+            </div>
+          </div>
         </div>
       </div>
     </div>
   );
 }
+
+// ─── Inline style helpers ─────────────────────────────────────────────────────
+const btnS = (bg, border = "none") => ({
+  padding: "0.4rem 0.75rem", background: bg, border,
+  borderRadius: "0.3rem", color: "white", fontWeight: "700",
+  cursor: "pointer", fontSize: "0.7rem",
+});
+const inpS = {
+  width: "100%", padding: "0.4rem", background: "#162032",
+  border: "1px solid #1e293b", borderRadius: "0.25rem",
+  color: "white", fontSize: "0.7rem", outline: "none", boxSizing: "border-box",
+};
+const lblS = { fontSize: "0.55rem", color: "#334155", letterSpacing: "0.1em", marginBottom: "0.3rem" };
+const crdS = { background: "#060d1a", borderRadius: "0.3rem", padding: "0.5rem", border: "1px solid #162032" };

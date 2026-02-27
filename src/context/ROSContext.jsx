@@ -1,104 +1,205 @@
-import React, { createContext, useContext, useEffect, useRef, useState } from "react";
+import React, {
+  createContext,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+  useCallback,
+} from "react";
 
-// ? ROSLIB do?ru ?ekilde import
-const ROSLIB = window.ROSLIB;
+import * as ROSLIB from "roslib";
 
 const ROSContext = createContext(null);
 
+// --- Varsayılan IP ayarı (localStorage'dan okunur) ---
+const LS_URL_KEY = "rosbridge_url_v1";
+const DEFAULT_URL = `ws://${window.location.hostname || "localhost"}:9090`;
+
+function loadUrl() {
+  // Her zaman tarayıcının hostname'ini kullan — farklı ağlarda sorun çıkmasın
+  return DEFAULT_URL;
+}
+
+function saveUrl(url) {
+  try {
+    localStorage.setItem(LS_URL_KEY, url);
+  } catch {}
+}
+
 export function ROSProvider({ children }) {
-  const [status, setStatus] = useState("Ba?lanmad?");
+  const [rosbridgeUrl, setRosbridgeUrl] = useState(loadUrl);
+  const [status, setStatus] = useState("Bağlanmadı");
   const [errorText, setErrorText] = useState("");
-  const [rosbridgeUrl, setRosbridgeUrl] = useState("ws://192.168.1.117:9090");
-  
+  const [isConnected, setIsConnected] = useState(false);
+
+  // ros nesnesini hem ref hem state'te tutuyoruz:
+  //   ref  → callback'ler içinde güncel değere erişmek için
+  //   state → değiştiğinde tüm consumer'ları re-render etmek için
   const rosRef = useRef(null);
-  const isConnectingRef = useRef(false);
+  const [rosInstance, setRosInstance] = useState(null);
 
+  const reconnectTimer = useRef(null);
+  const mountedRef = useRef(true);
+  const connectingRef = useRef(false);
+
+  // URL değişince localStorage'a yaz
   useEffect(() => {
-    // ROSLIB yüklü mü kontrol et
-    if (!window.ROSLIB) {
-      console.error("[ROSContext] ? ROSLIB yüklenmedi! index.html'de <script> tag'?n? kontrol et");
-      setStatus("ROSLIB yüklemesi hatas?");
-      setErrorText("ROSLIB kütüphanesi bulunamad?");
-      return;
-    }
+    saveUrl(rosbridgeUrl);
+  }, [rosbridgeUrl]);
 
-    console.log("[ROSContext] ROSLIB yüklü:", window.ROSLIB);
+  // --- Bağlantı kur ---
+  const connect = useCallback(
+    (url) => {
+      // Zaten bağlanıyorsak tekrar deneme
+      if (connectingRef.current) return;
 
-    if (rosRef.current?.isConnected && !isConnectingRef.current) {
-      return;
-    }
+      // ROSLIB npm'den import edildi, her zaman mevcut
 
-    if (isConnectingRef.current) {
-      return;
-    }
+      // Eski bağlantıyı temiz kapat
+      if (rosRef.current) {
+        try {
+          rosRef.current.removeAllListeners();
+          rosRef.current.close();
+        } catch {}
+        rosRef.current = null;
+        // State sadece gerekliyse güncelle (gereksiz re-render önle)
+        setRosInstance((prev) => prev ? null : prev);
+        setIsConnected((prev) => prev ? false : prev);
+      }
 
-    isConnectingRef.current = true;
-    setStatus("Ba?lan?yor...");
-    setErrorText("");
+      connectingRef.current = true;
+      setStatus((prev) => prev === "Bağlanıyor..." ? prev : "Bağlanıyor...");
+      setErrorText((prev) => prev ? "" : prev);
 
-    console.log("[ROSContext] Ba?lan?yor:", rosbridgeUrl);
-
-    try {
-      const ros = new ROSLIB.Ros({ url: rosbridgeUrl });
-      rosRef.current = ros;
+      const ros = new ROSLIB.Ros({ url });
 
       ros.on("connection", () => {
-        console.log("[ROSContext] ? Ba?land?!");
-        setStatus("Ba?land?");
+        if (!mountedRef.current) return;
+        console.log("[ROSContext] ✅ Bağlandı!");
+        connectingRef.current = false;
+        rosRef.current = ros;
+        setRosInstance(ros);
+        setIsConnected(true);
+        setStatus("Bağlandı");
         setErrorText("");
-        isConnectingRef.current = false;
+
+        // Reconnect timer varsa iptal et
+        if (reconnectTimer.current) {
+          clearTimeout(reconnectTimer.current);
+          reconnectTimer.current = null;
+        }
       });
 
       ros.on("close", () => {
-        console.log("[ROSContext] ?? Ba?lant? koptu");
-        setStatus("Ba?lant? koptu");
-        isConnectingRef.current = false;
-        setTimeout(() => {
-          if (!rosRef.current?.isConnected) {
-            isConnectingRef.current = false;
+        if (!mountedRef.current) return;
+        connectingRef.current = false;
+        rosRef.current = null;
+        setRosInstance((prev) => prev ? null : prev);
+        setIsConnected((prev) => {
+          if (prev) {
+            console.log("[ROSContext] 🔌 Bağlantı koptu");
+            setStatus("Bağlantı koptu");
           }
-        }, 3000);
+          return false;
+        });
+
+        // Otomatik reconnect (5 saniye sonra)
+        if (!reconnectTimer.current) {
+          reconnectTimer.current = setTimeout(() => {
+            reconnectTimer.current = null;
+            if (mountedRef.current) {
+              connect(url);
+            }
+          }, 5000);
+        }
       });
 
       ros.on("error", (e) => {
-        console.error("[ROSContext] ? Hata:", e);
-        setStatus("Ba?lant? hatas?");
-        setErrorText(e?.message || String(e));
-        isConnectingRef.current = false;
+        if (!mountedRef.current) return;
+        // error event'i close'dan ÖNCE gelir — connectingRef'i burada sıfırlama
+        // close handler zaten sıfırlayacak ve reconnect planlayacak
+        const msg = e?.message || (e?.type === "error" ? "ROSBridge bağlantısı kurulamadı" : String(e));
+        setStatus((prev) => prev === "Bağlantı hatası" ? prev : "Bağlantı hatası");
+        setErrorText((prev) => prev === msg ? prev : msg);
       });
 
-    } catch (err) {
-      console.error("[ROSContext] Catch hatas?:", err);
-      setStatus("Ba?lant? hatas?");
-      setErrorText(err.message);
-      isConnectingRef.current = false;
-    }
+      // ❗ rosRef'i tut ama state'i GÜNCELLEME — sadece "connection" event'inde güncelle
+      rosRef.current = ros;
+    },
+    [] // connect fonksiyonu sabit, url parametre olarak alıyor
+  );
+
+  // --- URL değişince bağlan ---
+  useEffect(() => {
+    mountedRef.current = true;
+
+    connect(rosbridgeUrl);
 
     return () => {
-      console.log("[ROSContext] Cleanup - ba?lant? aç?k kalacak");
+      // StrictMode cleanup: sadece timer'ı temizle, bağlantıyı KAPATMA
+      // Gerçek unmount'ta (provider kaldırılınca) bağlantı kapanır
+      mountedRef.current = false;
+      connectingRef.current = false;
+
+      if (reconnectTimer.current) {
+        clearTimeout(reconnectTimer.current);
+        reconnectTimer.current = null;
+      }
     };
-  }, [rosbridgeUrl]);
+  }, [rosbridgeUrl, connect]);
+
+  // --- Tam unmount'ta bağlantıyı kapat ---
+  useEffect(() => {
+    return () => {
+      console.log("[ROSContext] Provider unmount — bağlantı kapatılıyor");
+      if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+      if (rosRef.current) {
+        try {
+          rosRef.current.removeAllListeners();
+          rosRef.current.close();
+        } catch {}
+      }
+    };
+  }, []);
+
+  // --- Manuel yeniden bağlan butonu için ---
+  const reconnect = useCallback(() => {
+    console.log("[ROSContext] Manuel reconnect tetiklendi");
+    // Her şeyi sıfırla
+    if (reconnectTimer.current) {
+      clearTimeout(reconnectTimer.current);
+      reconnectTimer.current = null;
+    }
+    // Eski bağlantıyı zorla kapat
+    if (rosRef.current) {
+      try {
+        rosRef.current.removeAllListeners();
+        rosRef.current.close();
+      } catch {}
+      rosRef.current = null;
+      setRosInstance(null);
+      setIsConnected(false);
+    }
+    connectingRef.current = false;
+    // Kısa gecikmeyle yeniden bağlan
+    setTimeout(() => connect(rosbridgeUrl), 300);
+  }, [rosbridgeUrl, connect]);
 
   const value = {
-    ros: rosRef.current,
-    isConnected: rosRef.current?.isConnected ?? false,
+    ros: rosInstance,      // state tabanlı → değişince re-render olur
+    isConnected,
     status,
     errorText,
-    setRosbridgeUrl,
     rosbridgeUrl,
+    setRosbridgeUrl,       // IP değiştirmek için
+    reconnect,             // manuel yeniden bağlan
   };
 
-  return (
-    <ROSContext.Provider value={value}>
-      {children}
-    </ROSContext.Provider>
-  );
+  return <ROSContext.Provider value={value}>{children}</ROSContext.Provider>;
 }
 
 export function useROS() {
-  const context = useContext(ROSContext);
-  if (!context) {
-    throw new Error("useROS must be used within ROSProvider");
-  }
-  return context;
+  const ctx = useContext(ROSContext);
+  if (!ctx) throw new Error("useROS must be used within ROSProvider");
+  return ctx;
 }

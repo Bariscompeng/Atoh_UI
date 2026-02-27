@@ -7,11 +7,13 @@ import MapPage from "./pages/MapPage";
 import HumanSnapshots from "./pages/HumanSnapshots";
 import CoveragePage from "./pages/CoveragePage";
 import HealthPage from "./pages/HealthPage";
+import PiezoPage from "./pages/PiezoPage";
+import TerminalPage from "./pages/TerminalPage";
 
 export default function App() {
   return (
-    <BrowserRouter>  {/* ? BrowserRouter EN DI? */}
-      <ROSProvider>  {/* ? ROSProvider ?Ç?NDE */}
+    <BrowserRouter>
+      <ROSProvider>
         <div className="app-container">
           <TopNav />
           <Routes>
@@ -20,6 +22,8 @@ export default function App() {
             <Route path="/human-snapshots" element={<HumanSnapshots />} />
             <Route path="/health" element={<HealthPage />} />
             <Route path="/coverage" element={<CoveragePage />} />
+            <Route path="/piezo" element={<PiezoPage />} />
+            <Route path="/terminal" element={<TerminalPage />} />
           </Routes>
         </div>
       </ROSProvider>

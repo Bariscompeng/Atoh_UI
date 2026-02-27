@@ -1,120 +1,75 @@
 import React, { useEffect, useRef, useState } from "react";
+import { useROS } from "../context/ROSContext";
 
-function guessWsUrl() {
-  const host = window.location.hostname || "localhost";
-  return `ws://${host}:9090`;
-}
+import * as ROSLIB from "roslib";
 
 export default function MapPage() {
-  const [wsUrl, setWsUrl] = useState(guessWsUrl());
-  const [isConnected, setIsConnected] = useState(false);
+  const { ros, isConnected, status: globalStatus, errorText: globalErrorText, reconnect } = useROS();
+
   const [mapTopic, setMapTopic] = useState("/map");
   const [poseTopic, setPoseTopic] = useState("/amcl_pose");
   const [mapData, setMapData] = useState(null);
   const [robotPose, setRobotPose] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
   const [zoomLevel, setZoomLevel] = useState(1);
-  const [statusText, setStatusText] = useState("Bağlantı yok");
 
-  const wsRef = useRef(null);
   const canvasRef = useRef(null);
   const viewportRef = useRef(null);
   const [fitScale, setFitScale] = useState(1);
 
-  const mapSubIdRef = useRef(null);
-  const poseSubIdRef = useRef(null);
+  const mapSubRef = useRef(null);
+  const poseSubRef = useRef(null);
 
-  const sendMessage = (msg) => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(msg));
+  // ---- Subscribe to map & pose topics via ROSLIB ----
+  useEffect(() => {
+    if (!ros || !isConnected) {
+      setMapData(null);
+      setRobotPose(null);
+      return;
     }
-  };
 
-  const subscribe = (topic, messageType) => {
-    const subId = `sub_${topic}_${Date.now()}`;
-    sendMessage({
-      op: "subscribe",
-      id: subId,
-      topic: topic,
-      type: messageType
+    console.log("[MapPage] ROS bağlı, subscribe:", mapTopic, poseTopic);
+
+    // Map topic
+    const mapSub = new ROSLIB.Topic({
+      ros,
+      name: mapTopic,
+      messageType: "nav_msgs/OccupancyGrid",
+      queue_length: 1,
+      throttle_rate: 200,
     });
-    return subId;
-  };
 
-  const unsubscribe = (subId) => {
-    if (subId) {
-      sendMessage({
-        op: "unsubscribe",
-        id: subId
-      });
-    }
-  };
+    mapSub.subscribe((msg) => {
+      setMapData(msg);
+    });
+    mapSubRef.current = mapSub;
 
-  const connect = () => {
-    disconnect();
-    setStatusText("Bağlanıyor...");
-    
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
+    // Pose topic
+    const poseSub = new ROSLIB.Topic({
+      ros,
+      name: poseTopic,
+      messageType: "geometry_msgs/PoseWithCovarianceStamped",
+      queue_length: 1,
+      throttle_rate: 100,
+    });
 
-    ws.onopen = () => {
-      setIsConnected(true);
-      setStatusText("Bağlantı sağlandı");
-      
-      // Subscribe to map
-      mapSubIdRef.current = subscribe(mapTopic, "nav_msgs/OccupancyGrid");
-      
-      // Subscribe to pose
-      poseSubIdRef.current = subscribe(poseTopic, "geometry_msgs/PoseWithCovarianceStamped");
-    };
-
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        
-        if (data.op === "publish") {
-          // Map data
-          if (data.topic === mapTopic) {
-            setMapData(data.msg);
-          }
-          // Pose data
-          else if (data.topic === poseTopic) {
-            setRobotPose(data.msg.pose.pose);
-          }
-        }
-      } catch (e) {
-        console.error("Message parse error:", e);
+    poseSub.subscribe((msg) => {
+      if (msg?.pose?.pose) {
+        setRobotPose(msg.pose.pose);
       }
+    });
+    poseSubRef.current = poseSub;
+
+    return () => {
+      console.log("[MapPage] Cleanup subscriptions");
+      try { mapSub.unsubscribe(); } catch {}
+      try { poseSub.unsubscribe(); } catch {}
+      mapSubRef.current = null;
+      poseSubRef.current = null;
     };
+  }, [ros, isConnected, mapTopic, poseTopic]);
 
-    ws.onerror = () => {
-      setIsConnected(false);
-      setStatusText("Bağlantı hatası");
-    };
-
-    ws.onclose = () => {
-      setIsConnected(false);
-      setStatusText("Bağlantı kapandı");
-    };
-  };
-
-  const disconnect = () => {
-    if (mapSubIdRef.current) {
-      unsubscribe(mapSubIdRef.current);
-      mapSubIdRef.current = null;
-    }
-    if (poseSubIdRef.current) {
-      unsubscribe(poseSubIdRef.current);
-      poseSubIdRef.current = null;
-    }
-    if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
-    }
-    setIsConnected(false);
-    setStatusText("Bağlantı yok");
-  };
-
+  // ---- Fit scale hesapla ----
   useEffect(() => {
     if (!mapData || !viewportRef.current) return;
 
@@ -134,12 +89,7 @@ export default function MapPage() {
     return () => window.removeEventListener("resize", recompute);
   }, [mapData]);
 
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => disconnect();
-  }, []);
-
-  // Haritayı ve robotu çiz
+  // ---- Haritayı ve robotu çiz ----
   useEffect(() => {
     if (!mapData || !canvasRef.current || !viewportRef.current) return;
 
@@ -148,14 +98,12 @@ export default function MapPage() {
 
     const dpr = window.devicePixelRatio || 1;
 
-    const vw = viewportRef.current.clientWidth;   // viewport width (CSS px)
-    const vh = viewportRef.current.clientHeight;  // viewport height (CSS px)
+    const vw = viewportRef.current.clientWidth;
+    const vh = viewportRef.current.clientHeight;
 
-    // canvas gerçek piksel boyutu (retina için dpr ile)
-    canvas.width  = Math.max(1, Math.floor(vw * dpr));
+    canvas.width = Math.max(1, Math.floor(vw * dpr));
     canvas.height = Math.max(1, Math.floor(vh * dpr));
 
-    // çizimde dpr düzelt
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, vw, vh);
     ctx.imageSmoothingEnabled = false;
@@ -166,17 +114,14 @@ export default function MapPage() {
     const origin = mapData.info.origin;
     const data = mapData.data;
 
-    // map'i viewport'a sığdır (zoomLevel ekstra çarpan)
     const baseScale = Math.min(vw / mw, vh / mh);
     const scale = baseScale * zoomLevel;
 
-    // ortalamak için offset
     const drawW = mw * scale;
     const drawH = mh * scale;
     const offsetX = (vw - drawW) / 2;
     const offsetY = (vh - drawH) / 2;
 
-    // occupancy -> image (1 kez render)
     const tempCanvas = document.createElement("canvas");
     tempCanvas.width = mw;
     tempCanvas.height = mh;
@@ -194,15 +139,13 @@ export default function MapPage() {
     }
     tempCtx.putImageData(imageData, 0, 0);
 
-    // map çiz: transform = scale + offset
     ctx.save();
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // reset
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.translate(offsetX, offsetY);
     ctx.scale(scale, scale);
     ctx.drawImage(tempCanvas, 0, 0);
     ctx.restore();
 
-    // robot çiz (map koordinat -> canvas koordinat)
     if (robotPose) {
       const px = (robotPose.position.x - origin.position.x) / resolution;
       const py = mh - (robotPose.position.y - origin.position.y) / resolution;
@@ -219,7 +162,6 @@ export default function MapPage() {
       ctx.save();
       ctx.translate(cx, cy);
 
-      // gövde
       ctx.beginPath();
       ctx.arc(0, 0, 8, 0, Math.PI * 2);
       ctx.fillStyle = "#3b82f6";
@@ -228,7 +170,6 @@ export default function MapPage() {
       ctx.lineWidth = 2;
       ctx.stroke();
 
-      // yön oku
       ctx.rotate(-yaw);
       ctx.beginPath();
       ctx.moveTo(0, 0);
@@ -289,8 +230,13 @@ export default function MapPage() {
               <span style={{ fontSize: '1.25rem' }}>{isConnected ? '🟢' : '🔴'}</span>
               <div>
                 <div style={{ fontWeight: '600', fontSize: '0.875rem' }}>
-                  {statusText}
+                  {globalStatus}
                 </div>
+                {globalErrorText && (
+                  <div style={{ fontSize: '0.75rem', color: '#f87171', marginTop: '0.125rem' }}>
+                    {globalErrorText}
+                  </div>
+                )}
                 {robotPose && (
                   <div style={{ fontSize: '0.625rem', color: '#94a3b8', marginTop: '0.125rem' }}>
                     Robot: ({robotPose.position.x.toFixed(2)}, {robotPose.position.y.toFixed(2)})
@@ -299,10 +245,10 @@ export default function MapPage() {
               </div>
             </div>
             
-            <div style={{ display: 'flex', gap: '0.5rem' }}>
-              {!isConnected ? (
+            <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+              {!isConnected && (
                 <button 
-                  onClick={connect} 
+                  onClick={reconnect} 
                   style={{ 
                     padding: '0.5rem 1rem', 
                     background: '#2563eb', 
@@ -314,24 +260,13 @@ export default function MapPage() {
                     fontWeight: '600'
                   }}
                 >
-                  🔗 Bağlan
+                  🔌 Bağlan
                 </button>
-              ) : (
-                <button 
-                  onClick={disconnect} 
-                  style={{ 
-                    padding: '0.5rem 1rem', 
-                    background: '#475569', 
-                    border: 'none', 
-                    borderRadius: '0.5rem', 
-                    color: 'white', 
-                    cursor: 'pointer',
-                    fontSize: '0.75rem',
-                    fontWeight: '600'
-                  }}
-                >
-                  ❌ Kes
-                </button>
+              )}
+              {isConnected && (
+                <span style={{ fontSize: '0.75rem', color: '#10b981', fontWeight: '600' }}>
+                  ✅ ROS Bağlı
+                </span>
               )}
             </div>
           </div>
@@ -350,28 +285,6 @@ export default function MapPage() {
               ⚙️ Ayarlar
             </h2>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '0.75rem' }}>
-              <div>
-                <label style={{ display: 'block', fontSize: '0.75rem', marginBottom: '0.25rem', color: '#cbd5e1' }}>
-                  ROSBridge WebSocket URL
-                </label>
-                <input
-                  type="text"
-                  value={wsUrl}
-                  onChange={(e) => setWsUrl(e.target.value)}
-                  placeholder="ws://<robot_ip>:9090"
-                  style={{ 
-                    width: '100%', 
-                    padding: '0.5rem', 
-                    background: '#334155', 
-                    border: '1px solid #475569', 
-                    borderRadius: '0.375rem', 
-                    color: 'white', 
-                    outline: 'none',
-                    fontSize: '0.875rem'
-                  }}
-                />
-              </div>
-              
               <div>
                 <label style={{ display: 'block', fontSize: '0.75rem', marginBottom: '0.25rem', color: '#cbd5e1' }}>
                   Map Topic
@@ -431,18 +344,6 @@ export default function MapPage() {
                 />
               </div>
             </div>
-
-            {/* ROSBridge Protocol Info */}
-            <div style={{ marginTop: '0.75rem', padding: '0.75rem', background: '#0f172a', borderRadius: '0.375rem', border: '1px solid #334155' }}>
-              <div style={{ fontSize: '0.75rem', color: '#cbd5e1' }}>
-                <div style={{ fontWeight: '600', marginBottom: '0.375rem' }}>ℹ️ ROSBridge Protokol Bilgisi</div>
-                <div style={{ fontSize: '0.625rem', color: '#94a3b8', lineHeight: 1.5 }}>
-                  ℹ️ Bu sayfa doğrudan WebSocket üzerinden ROSBridge protokolü kullanır<br/>
-                  ℹ️ Mesaj formatı: <code style={{ color: '#60a5fa' }}>&#123;"op": "subscribe", "topic": "/map"&#125;</code><br/>
-                  ℹ️ Robot üzerinde rosbridge_server çalışıyor olmalı
-                </div>
-              </div>
-            </div>
           </div>
         )}
 
@@ -492,8 +393,8 @@ export default function MapPage() {
                   flexWrap: "wrap",
                 }}
               >
-                <div>🌍 {mapData.info.width}×{mapData.info.height}px</div>
-                <div>🔍 {mapData.info.resolution.toFixed(3)}m/px</div>
+                <div>📐 {mapData.info.width}×{mapData.info.height}px</div>
+                <div>📏 {mapData.info.resolution.toFixed(3)}m/px</div>
                 <div>🤖 Robot {robotPose ? "Active" : "Inactive"}</div>
               </div>
             </div>
@@ -547,4 +448,3 @@ export default function MapPage() {
     </div>
   );
 }
-
