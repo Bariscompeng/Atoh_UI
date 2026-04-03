@@ -9,7 +9,7 @@ import CoveragePage from "./pages/CoveragePage";
 import HealthPage from "./pages/HealthPage";
 import PiezoPage from "./pages/PiezoPage";
 import TerminalPage from "./pages/TerminalPage";
-
+import TaskManagerPage from "./pages/TaskManagerPage";
 export default function App() {
   return (
     <BrowserRouter>
@@ -24,6 +24,7 @@ export default function App() {
             <Route path="/coverage" element={<CoveragePage />} />
             <Route path="/piezo" element={<PiezoPage />} />
             <Route path="/terminal" element={<TerminalPage />} />
+            <Route path="/tasks" element={<TaskManagerPage />} />
           </Routes>
         </div>
       </ROSProvider>

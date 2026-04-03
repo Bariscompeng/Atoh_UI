@@ -1,450 +1,301 @@
 import React, { useEffect, useRef, useState } from "react";
 import { useROS } from "../context/ROSContext";
-
 import * as ROSLIB from "roslib";
+
+const BG      = "#04090f";
+const SURFACE = "#07111d";
+const BORDER  = "#0f2236";
+const BORDER2 = "#162d46";
+const TEXT    = "#c8dde8";
+const TEXT2   = "#4a7a96";
+const TEXT3   = "#1e3a52";
+const ACCENT  = "#0ea5e9";
+const MONO    = "'JetBrains Mono','Fira Code',monospace";
+
+const btnStyle = (color, bg, border) => ({
+  padding: "0.42rem 0.75rem", background: bg, border,
+  borderRadius: 5, color, cursor: "pointer",
+  fontWeight: 700, fontSize: "0.65rem", fontFamily: MONO,
+  transition: "all 0.15s", whiteSpace: "nowrap",
+});
+const inpStyle = {
+  width: "100%", padding: "0.42rem 0.55rem",
+  background: "#03070e", border: `1px solid ${BORDER}`,
+  borderRadius: 4, color: TEXT, fontSize: "0.68rem",
+  outline: "none", fontFamily: MONO, boxSizing: "border-box",
+};
+const lblStyle = {
+  fontSize: "0.53rem", color: TEXT3, letterSpacing: "0.1em",
+  marginBottom: "0.3rem", textTransform: "uppercase",
+};
 
 export default function MapPage() {
   const { ros, isConnected, status: globalStatus, errorText: globalErrorText, reconnect } = useROS();
 
-  const [mapTopic, setMapTopic] = useState("/map");
-  const [poseTopic, setPoseTopic] = useState("/amcl_pose");
-  const [mapData, setMapData] = useState(null);
-  const [robotPose, setRobotPose] = useState(null);
+  const [mapTopic,     setMapTopic]     = useState("/map");
+  const [poseTopic,    setPoseTopic]    = useState("/amcl_pose");
+  const [mapData,      setMapData]      = useState(null);
+  const [robotPose,    setRobotPose]    = useState(null);
   const [showSettings, setShowSettings] = useState(false);
-  const [zoomLevel, setZoomLevel] = useState(1);
+  const [zoomLevel,    setZoomLevel]    = useState(1);
 
-  const canvasRef = useRef(null);
+  const canvasRef   = useRef(null);
   const viewportRef = useRef(null);
-  const [fitScale, setFitScale] = useState(1);
+  const mapSubRef   = useRef(null);
+  const poseSubRef  = useRef(null);
 
-  const mapSubRef = useRef(null);
-  const poseSubRef = useRef(null);
-
-  // ---- Subscribe to map & pose topics via ROSLIB ----
   useEffect(() => {
-    if (!ros || !isConnected) {
-      setMapData(null);
-      setRobotPose(null);
-      return;
-    }
+    if (!ros || !isConnected) { setMapData(null); setRobotPose(null); return; }
 
-    console.log("[MapPage] ROS bağlı, subscribe:", mapTopic, poseTopic);
-
-    // Map topic
     const mapSub = new ROSLIB.Topic({
-      ros,
-      name: mapTopic,
-      messageType: "nav_msgs/OccupancyGrid",
-      queue_length: 1,
-      throttle_rate: 200,
+      ros, name: mapTopic, messageType: "nav_msgs/OccupancyGrid",
+      queue_length: 1, throttle_rate: 200,
     });
-
-    mapSub.subscribe((msg) => {
-      setMapData(msg);
-    });
+    mapSub.subscribe(msg => setMapData(msg));
     mapSubRef.current = mapSub;
 
-    // Pose topic
     const poseSub = new ROSLIB.Topic({
-      ros,
-      name: poseTopic,
-      messageType: "geometry_msgs/PoseWithCovarianceStamped",
-      queue_length: 1,
-      throttle_rate: 100,
+      ros, name: poseTopic, messageType: "geometry_msgs/PoseWithCovarianceStamped",
+      queue_length: 1, throttle_rate: 100,
     });
-
-    poseSub.subscribe((msg) => {
-      if (msg?.pose?.pose) {
-        setRobotPose(msg.pose.pose);
-      }
-    });
+    poseSub.subscribe(msg => { if (msg?.pose?.pose) setRobotPose(msg.pose.pose); });
     poseSubRef.current = poseSub;
 
     return () => {
-      console.log("[MapPage] Cleanup subscriptions");
-      try { mapSub.unsubscribe(); } catch {}
+      try { mapSub.unsubscribe(); }  catch {}
       try { poseSub.unsubscribe(); } catch {}
-      mapSubRef.current = null;
-      poseSubRef.current = null;
     };
   }, [ros, isConnected, mapTopic, poseTopic]);
 
-  // ---- Fit scale hesapla ----
-  useEffect(() => {
-    if (!mapData || !viewportRef.current) return;
-
-    const recompute = () => {
-      const vw = viewportRef.current.clientWidth;
-      const vh = viewportRef.current.clientHeight;
-      const mw = mapData.info.width;
-      const mh = mapData.info.height;
-
-      if (mw <= 0 || mh <= 0) return;
-      const s = Math.min(vw / mw, vh / mh);
-      setFitScale(s);
-    };
-
-    recompute();
-    window.addEventListener("resize", recompute);
-    return () => window.removeEventListener("resize", recompute);
-  }, [mapData]);
-
-  // ---- Haritayı ve robotu çiz ----
   useEffect(() => {
     if (!mapData || !canvasRef.current || !viewportRef.current) return;
 
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext("2d");
+    const canvas  = canvasRef.current;
+    const ctx     = canvas.getContext("2d");
+    const dpr     = window.devicePixelRatio || 1;
+    const vw      = viewportRef.current.clientWidth;
+    const vh      = viewportRef.current.clientHeight;
 
-    const dpr = window.devicePixelRatio || 1;
-
-    const vw = viewportRef.current.clientWidth;
-    const vh = viewportRef.current.clientHeight;
-
-    canvas.width = Math.max(1, Math.floor(vw * dpr));
+    canvas.width  = Math.max(1, Math.floor(vw * dpr));
     canvas.height = Math.max(1, Math.floor(vh * dpr));
-
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, vw, vh);
     ctx.imageSmoothingEnabled = false;
 
-    const mw = mapData.info.width;
-    const mh = mapData.info.height;
-    const resolution = mapData.info.resolution;
-    const origin = mapData.info.origin;
-    const data = mapData.data;
+    const { width: mw, height: mh, resolution, origin } = mapData.info;
+    const data    = mapData.data;
+    const scale   = Math.min(vw / mw, vh / mh) * zoomLevel;
+    const offsetX = (vw - mw * scale) / 2;
+    const offsetY = (vh - mh * scale) / 2;
 
-    const baseScale = Math.min(vw / mw, vh / mh);
-    const scale = baseScale * zoomLevel;
-
-    const drawW = mw * scale;
-    const drawH = mh * scale;
-    const offsetX = (vw - drawW) / 2;
-    const offsetY = (vh - drawH) / 2;
-
-    const tempCanvas = document.createElement("canvas");
-    tempCanvas.width = mw;
-    tempCanvas.height = mh;
-    const tempCtx = tempCanvas.getContext("2d");
-    const imageData = tempCtx.createImageData(mw, mh);
-
+    const tmp    = document.createElement("canvas");
+    tmp.width    = mw; tmp.height = mh;
+    const tmpCtx = tmp.getContext("2d");
+    const img    = tmpCtx.createImageData(mw, mh);
     for (let i = 0; i < data.length; i++) {
       const v = data[i];
-      const c = v === -1 ? 128 : (v === 0 ? 255 : 0);
+      // RViz standard: free=white(205), obstacle=black(0), unknown=gray(128)
+      const c = v === -1 ? 128 : v === 0 ? 205 : 0;
       const idx = i * 4;
-      imageData.data[idx] = c;
-      imageData.data[idx + 1] = c;
-      imageData.data[idx + 2] = c;
-      imageData.data[idx + 3] = 255;
+      img.data[idx] = c; img.data[idx+1] = c; img.data[idx+2] = c; img.data[idx+3] = 255;
     }
-    tempCtx.putImageData(imageData, 0, 0);
+    tmpCtx.putImageData(img, 0, 0);
 
     ctx.save();
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.translate(offsetX, offsetY);
     ctx.scale(scale, scale);
-    ctx.drawImage(tempCanvas, 0, 0);
+    ctx.drawImage(tmp, 0, 0);
     ctx.restore();
 
     if (robotPose) {
-      const px = (robotPose.position.x - origin.position.x) / resolution;
-      const py = mh - (robotPose.position.y - origin.position.y) / resolution;
+      const px  = (robotPose.position.x - origin.position.x) / resolution;
+      const py  = mh - (robotPose.position.y - origin.position.y) / resolution;
+      const cx  = offsetX + px * scale;
+      const cy  = offsetY + py * scale;
+      const q   = robotPose.orientation;
+      const yaw = Math.atan2(2*(q.w*q.z + q.x*q.y), 1 - 2*(q.y*q.y + q.z*q.z));
 
-      const cx = offsetX + px * scale;
-      const cy = offsetY + py * scale;
+      const grad = ctx.createRadialGradient(cx, cy, 4, cx, cy, 22);
+      grad.addColorStop(0, "rgba(14,165,233,0.4)");
+      grad.addColorStop(1, "rgba(14,165,233,0)");
+      ctx.beginPath(); ctx.arc(cx, cy, 22, 0, Math.PI*2);
+      ctx.fillStyle = grad; ctx.fill();
 
-      const q = robotPose.orientation;
-      const yaw = Math.atan2(
-        2.0 * (q.w * q.z + q.x * q.y),
-        1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-      );
+      ctx.beginPath(); ctx.arc(cx, cy, 7, 0, Math.PI*2);
+      ctx.fillStyle = ACCENT;
+      ctx.shadowColor = ACCENT; ctx.shadowBlur = 10;
+      ctx.fill();
+      ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.shadowBlur = 0;
 
       ctx.save();
-      ctx.translate(cx, cy);
-
-      ctx.beginPath();
-      ctx.arc(0, 0, 8, 0, Math.PI * 2);
-      ctx.fillStyle = "#3b82f6";
-      ctx.fill();
-      ctx.strokeStyle = "#1d4ed8";
-      ctx.lineWidth = 2;
-      ctx.stroke();
-
-      ctx.rotate(-yaw);
-      ctx.beginPath();
-      ctx.moveTo(0, 0);
-      ctx.lineTo(20, 0);
-      ctx.strokeStyle = "#fbbf24";
-      ctx.lineWidth = 3;
-      ctx.stroke();
-
+      ctx.translate(cx, cy); ctx.rotate(-yaw);
+      ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(18, 0);
+      ctx.strokeStyle = "#facc15";
+      ctx.shadowColor = "#facc15"; ctx.shadowBlur = 6;
+      ctx.lineWidth = 3; ctx.lineCap = "round"; ctx.stroke();
       ctx.restore();
     }
   }, [mapData, robotPose, zoomLevel]);
 
   return (
-    <div style={{ 
-      height: 'calc(100vh - 56px)', 
-      background: 'linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #0f172a 100%)', 
-      color: 'white',
-      padding: '1rem',
-      fontFamily: 'system-ui, -apple-system, sans-serif',
-      overflow: 'auto',
-      display: 'flex',
-      flexDirection: 'column'
+    <div style={{
+      height: "calc(100vh - 56px)",
+      background: BG,
+      backgroundImage: "radial-gradient(rgba(14,165,233,0.06) 1px, transparent 1px)",
+      backgroundSize: "24px 24px",
+      color: TEXT, padding: "0.65rem",
+      fontFamily: MONO, overflow: "auto",
+      display: "flex", flexDirection: "column", gap: "0.5rem",
+      boxSizing: "border-box",
     }}>
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'auto' }}>
-        {/* Header */}
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-            <span style={{ fontSize: '1.5rem' }}>🗺️</span>
-            <h1 style={{ fontSize: '1.25rem', fontWeight: 'bold', margin: 0 }}>Live Map & Robot Position</h1>
-          </div>
-          
-          <button
-            onClick={() => setShowSettings(!showSettings)}
-            style={{ 
-              padding: '0.5rem 0.75rem', 
-              borderRadius: '0.5rem', 
-              background: '#334155', 
-              border: 'none', 
-              color: 'white', 
-              cursor: 'pointer',
-              fontSize: '0.875rem'
-            }}
-          >
-            ⚙️ {showSettings ? 'Gizle' : 'Ayarlar'}
-          </button>
-        </div>
 
-        {/* Status Bar */}
-        <div style={{ 
-          background: '#1e293b', 
-          borderRadius: '0.5rem', 
-          padding: '0.75rem', 
-          marginBottom: '1rem', 
-          border: '1px solid #334155' 
-        }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-              <span style={{ fontSize: '1.25rem' }}>{isConnected ? '🟢' : '🔴'}</span>
-              <div>
-                <div style={{ fontWeight: '600', fontSize: '0.875rem' }}>
-                  {globalStatus}
-                </div>
-                {globalErrorText && (
-                  <div style={{ fontSize: '0.75rem', color: '#f87171', marginTop: '0.125rem' }}>
-                    {globalErrorText}
-                  </div>
-                )}
-                {robotPose && (
-                  <div style={{ fontSize: '0.625rem', color: '#94a3b8', marginTop: '0.125rem' }}>
-                    Robot: ({robotPose.position.x.toFixed(2)}, {robotPose.position.y.toFixed(2)})
-                  </div>
-                )}
-              </div>
-            </div>
-            
-            <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-              {!isConnected && (
-                <button 
-                  onClick={reconnect} 
-                  style={{ 
-                    padding: '0.5rem 1rem', 
-                    background: '#2563eb', 
-                    border: 'none', 
-                    borderRadius: '0.5rem', 
-                    color: 'white', 
-                    cursor: 'pointer',
-                    fontSize: '0.75rem',
-                    fontWeight: '600'
-                  }}
-                >
-                  🔌 Bağlan
-                </button>
-              )}
-              {isConnected && (
-                <span style={{ fontSize: '0.75rem', color: '#10b981', fontWeight: '600' }}>
-                  ✅ ROS Bağlı
-                </span>
-              )}
-            </div>
+      {/* HEADER */}
+      <div style={{ flexShrink: 0, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "0.65rem" }}>
+          <div style={{
+            width: 32, height: 32, background: "rgba(14,165,233,0.1)",
+            border: `1px solid rgba(14,165,233,0.35)`, borderRadius: 6,
+            display: "flex", alignItems: "center", justifyContent: "center",
+            fontSize: "1rem", boxShadow: "0 0 12px rgba(14,165,233,0.15)",
+          }}>🗺️</div>
+          <div>
+            <div style={{ fontSize: "0.82rem", fontWeight: 800, letterSpacing: "0.14em", color: ACCENT }}>LIVE MAP</div>
+            <div style={{ fontSize: "0.55rem", color: TEXT2, letterSpacing: "0.1em", marginTop: 1 }}>OCCUPANCY GRID · ROBOT POSE</div>
           </div>
         </div>
+        <button
+          onClick={() => setShowSettings(v => !v)}
+          style={btnStyle(showSettings ? ACCENT : TEXT2, showSettings ? "rgba(14,165,233,0.1)" : "transparent", `1px solid ${showSettings ? "rgba(14,165,233,0.4)" : BORDER2}`)}>
+          ⚙ {showSettings ? "Gizle" : "Ayarlar"}
+        </button>
+      </div>
 
-        {/* Settings */}
-        {showSettings && (
-          <div style={{ 
-            background: '#1e293b', 
-            borderRadius: '0.5rem', 
-            padding: '1rem', 
-            marginBottom: '1rem', 
-            border: '1px solid #334155' 
-          }}>
-            <h2 style={{ fontSize: '1rem', fontWeight: 'bold', marginTop: 0, marginBottom: '0.75rem' }}>
-              ⚙️ Ayarlar
-            </h2>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '0.75rem' }}>
-              <div>
-                <label style={{ display: 'block', fontSize: '0.75rem', marginBottom: '0.25rem', color: '#cbd5e1' }}>
-                  Map Topic
-                </label>
-                <input
-                  type="text"
-                  value={mapTopic}
-                  onChange={(e) => setMapTopic(e.target.value)}
-                  placeholder="/map"
-                  style={{ 
-                    width: '100%', 
-                    padding: '0.5rem', 
-                    background: '#334155', 
-                    border: '1px solid #475569', 
-                    borderRadius: '0.375rem', 
-                    color: 'white', 
-                    outline: 'none',
-                    fontSize: '0.875rem'
-                  }}
-                />
-              </div>
-
-              <div>
-                <label style={{ display: 'block', fontSize: '0.75rem', marginBottom: '0.25rem', color: '#cbd5e1' }}>
-                  Pose Topic
-                </label>
-                <input
-                  type="text"
-                  value={poseTopic}
-                  onChange={(e) => setPoseTopic(e.target.value)}
-                  placeholder="/amcl_pose"
-                  style={{ 
-                    width: '100%', 
-                    padding: '0.5rem', 
-                    background: '#334155', 
-                    border: '1px solid #475569', 
-                    borderRadius: '0.375rem', 
-                    color: 'white', 
-                    outline: 'none',
-                    fontSize: '0.875rem'
-                  }}
-                />
-              </div>
-
-              <div>
-                <label style={{ display: 'block', fontSize: '0.75rem', marginBottom: '0.25rem', color: '#cbd5e1' }}>
-                  Zoom: {zoomLevel.toFixed(1)}x
-                </label>
-                <input
-                  type="range"
-                  min="0.5"
-                  max="3"
-                  step="0.1"
-                  value={zoomLevel}
-                  onChange={(e) => setZoomLevel(Number(e.target.value))}
-                  style={{ width: '100%' }}
-                />
-              </div>
-            </div>
-          </div>
+      {/* STATUS BAR */}
+      <div style={{
+        flexShrink: 0, background: SURFACE, borderRadius: 5,
+        padding: "0.45rem 0.85rem",
+        border: `1px solid ${isConnected ? "rgba(16,185,129,0.2)" : "rgba(239,68,68,0.2)"}`,
+        display: "flex", alignItems: "center", gap: "0.6rem", flexWrap: "wrap",
+      }}>
+        <div style={{
+          width: 7, height: 7, borderRadius: "50%", flexShrink: 0,
+          background: isConnected ? "#10b981" : "#ef4444",
+          boxShadow: `0 0 8px ${isConnected ? "#10b981" : "#ef4444"}`,
+        }} />
+        <span style={{ fontSize: "0.68rem", color: TEXT2, flex: 1 }}>{globalStatus || "—"}</span>
+        {globalErrorText && (
+          <span style={{ fontSize: "0.62rem", color: "#f87171", background: "rgba(239,68,68,0.08)", padding: "0.15rem 0.4rem", borderRadius: 3 }}>
+            ⚠ {globalErrorText}
+          </span>
         )}
+        {robotPose && (
+          <span style={{ fontSize: "0.62rem", color: "#facc15", fontWeight: 600, marginLeft: "auto" }}>
+            ⬡ x:{robotPose.position.x.toFixed(3)} &nbsp; y:{robotPose.position.y.toFixed(3)}
+          </span>
+        )}
+        {!isConnected && (
+          <button onClick={reconnect} style={btnStyle(ACCENT, "rgba(14,165,233,0.12)", `1px solid ${ACCENT}`)}>
+            ⚡ Bağlan
+          </button>
+        )}
+        {isConnected && (
+          <span style={{ fontSize: "0.62rem", color: "#10b981", fontWeight: 600 }}>● CONNECTED</span>
+        )}
+      </div>
 
-        {/* Map Canvas */}
-        <div style={{ 
-          background: '#1e293b', 
-          borderRadius: '0.5rem', 
-          padding: '1rem', 
-          border: '1px solid #334155',
-          flex: 1,
-          display: 'flex',
-          flexDirection: 'column',
-          minHeight: 0
+      {/* SETTINGS */}
+      {showSettings && (
+        <div style={{
+          flexShrink: 0, background: SURFACE, borderRadius: 6, padding: "0.85rem",
+          border: `1px solid ${BORDER2}`,
+          display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px,1fr))", gap: "0.65rem",
         }}>
-          {mapData ? (
-            <div style={{ textAlign: "center", flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-              <div
-                ref={viewportRef}
-                style={{
-                  flex: 1,
-                  overflow: "hidden",
-                  borderRadius: "0.5rem",
-                  border: "2px solid #475569",
-                  background: "#000",
-                  position: "relative",
-                  minHeight: 0
-                }}
-              >
-                <canvas
-                  ref={canvasRef}
-                  style={{
-                    width: "100%",
-                    height: "100%",
-                    display: "block",
-                  }}
-                />
-              </div>
-
-              <div
-                style={{
-                  marginTop: "0.75rem",
-                  fontSize: "0.75rem",
-                  color: "#94a3b8",
-                  display: "flex",
-                  justifyContent: "center",
-                  gap: "1.5rem",
-                  flexWrap: "wrap",
-                }}
-              >
-                <div>📐 {mapData.info.width}×{mapData.info.height}px</div>
-                <div>📏 {mapData.info.resolution.toFixed(3)}m/px</div>
-                <div>🤖 Robot {robotPose ? "Active" : "Inactive"}</div>
-              </div>
+          <div>
+            <div style={lblStyle}>Map Topic</div>
+            <input type="text" value={mapTopic} onChange={e => setMapTopic(e.target.value)} placeholder="/map" style={inpStyle} />
+          </div>
+          <div>
+            <div style={lblStyle}>Pose Topic</div>
+            <input type="text" value={poseTopic} onChange={e => setPoseTopic(e.target.value)} placeholder="/amcl_pose" style={inpStyle} />
+          </div>
+          <div>
+            <div style={lblStyle}>Zoom — {zoomLevel.toFixed(1)}×</div>
+            <input type="range" min="0.5" max="3" step="0.1" value={zoomLevel}
+              onChange={e => setZoomLevel(Number(e.target.value))}
+              style={{ width: "100%", accentColor: ACCENT, cursor: "pointer", marginTop: 8 }} />
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.55rem", color: TEXT3, marginTop: 4 }}>
+              <span>0.5×</span><span>3.0×</span>
             </div>
-          ) : (
-            <div style={{ textAlign: "center", padding: "4rem", color: "#64748b" }}>
-              <div style={{ fontSize: "3rem", marginBottom: "1rem" }}>🗺️</div>
-              <div style={{ fontSize: "1rem", fontWeight: "500" }}>
-                {isConnected ? "Harita bekleniyor..." : "Bağlantı kurun"}
-              </div>
-              <div style={{ fontSize: "0.75rem", marginTop: "0.5rem", color: "#475569" }}>
-                Topic: {mapTopic}
-              </div>
+          </div>
+        </div>
+      )}
+
+      {/* MAP CANVAS */}
+      <div style={{
+        flex: 1, background: SURFACE, borderRadius: 6, padding: "0.75rem",
+        border: `1px solid ${BORDER2}`, display: "flex", flexDirection: "column", minHeight: 0,
+      }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.45rem", flexShrink: 0, flexWrap: "wrap", gap: "0.3rem" }}>
+          <div style={{ fontSize: "0.68rem", fontWeight: 700, color: TEXT, letterSpacing: "0.1em" }}>MAP VIEW</div>
+          {mapData && (
+            <div style={{ fontSize: "0.58rem", color: TEXT2 }}>
+              {mapData.info.width}×{mapData.info.height}px &nbsp;·&nbsp; {mapData.info.resolution.toFixed(3)} m/px &nbsp;·&nbsp;
+              <span style={{ color: robotPose ? "#10b981" : TEXT3 }}>
+                {robotPose ? "● ROBOT TRACKED" : "○ NO POSE"}
+              </span>
             </div>
           )}
         </div>
 
-        {/* Legend */}
-        <div style={{ 
-          marginTop: '1rem', 
-          background: '#1e293b', 
-          borderRadius: '0.5rem', 
-          padding: '0.75rem', 
-          border: '1px solid #334155' 
-        }}>
-          <div style={{ 
-            display: 'flex', 
-            gap: '1.5rem', 
-            justifyContent: 'center', 
-            flexWrap: 'wrap',
-            fontSize: '0.75rem'
+        {mapData ? (
+          <div ref={viewportRef} style={{
+            flex: 1, overflow: "hidden", borderRadius: 5,
+            border: `1px solid ${BORDER2}`, background: "#020609",
+            position: "relative", minHeight: 0,
+            boxShadow: "inset 0 0 40px rgba(0,0,0,0.7)",
           }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-              <div style={{ width: 16, height: 16, background: '#fff', border: '1px solid #475569' }}></div>
-              Boş Alan
-            </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-              <div style={{ width: 16, height: 16, background: '#000', border: '1px solid #475569' }}></div>
-              Engel
-            </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-              <div style={{ width: 16, height: 16, background: '#808080', border: '1px solid #475569' }}></div>
-              Bilinmeyen
-            </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-              <div style={{ width: 16, height: 16, borderRadius: '50%', background: '#3b82f6', border: '1px solid #1d4ed8' }}></div>
-              Robot
-            </div>
+            <canvas ref={canvasRef} style={{ width: "100%", height: "100%", display: "block" }} />
           </div>
-        </div>
+        ) : (
+          <div style={{
+            flex: 1, display: "flex", flexDirection: "column",
+            alignItems: "center", justifyContent: "center",
+            gap: "0.75rem", minHeight: 200,
+          }}>
+            <div style={{ fontSize: "2.5rem", opacity: 0.15 }}>🗺️</div>
+            <div style={{ fontSize: "0.72rem", color: TEXT3 }}>
+              {isConnected ? "Harita bekleniyor..." : "Bağlantı bekleniyor"}
+            </div>
+            <div style={{ fontSize: "0.6rem", color: BORDER2 }}>{mapTopic}</div>
+          </div>
+        )}
       </div>
+
+      {/* LEGEND */}
+      <div style={{
+        flexShrink: 0, background: SURFACE, borderRadius: 5,
+        padding: "0.5rem 0.85rem", border: `1px solid ${BORDER2}`,
+        display: "flex", gap: "1.2rem", justifyContent: "center", flexWrap: "wrap",
+      }}>
+        {[
+          { color: "#cdcdcd", label: "FREE SPACE" },
+          { color: "#000000", label: "OBSTACLE"   },
+          { color: "#808080", label: "UNKNOWN"     },
+          { color: ACCENT,    label: "ROBOT", round: true },
+        ].map(({ color, label, round }) => (
+          <div key={label} style={{ display: "flex", alignItems: "center", gap: "0.4rem", fontSize: "0.6rem", color: TEXT2 }}>
+            <div style={{
+              width: 10, height: 10, background: color,
+              border: `1px solid ${BORDER2}`, borderRadius: round ? "50%" : 2,
+              boxShadow: label === "ROBOT" ? `0 0 5px ${ACCENT}` : "none",
+            }} />
+            {label}
+          </div>
+        ))}
+      </div>
+
     </div>
   );
 }

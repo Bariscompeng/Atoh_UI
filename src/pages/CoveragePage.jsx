@@ -120,6 +120,7 @@ export default function CoveragePage() {
   // Robot pose
   const [robotPose,  setRobotPose]  = useState(null);
   const [poseSource, setPoseSource] = useState("");
+  const [tfDebug,    setTfDebug]    = useState(null); // debug: raw transform data
 
   // Interaction
   const [points,     setPoints]     = useState([]);
@@ -129,6 +130,9 @@ export default function CoveragePage() {
   const goalDragRef  = useRef(null);
   const [goalDragEnd, setGoalDragEnd] = useState(null);
 
+  // Goal pose tracking (for cancel)
+  const [hasActiveGoal, setHasActiveGoal] = useState(false);
+
   // Path
   const [pathMsg,     setPathMsg]     = useState(null);
   const [showPreview, setShowPreview] = useState(true);
@@ -136,6 +140,10 @@ export default function CoveragePage() {
   // Exec
   const [execStatus,   setExecStatus]   = useState("idle");
   const [execFeedback, setExecFeedback] = useState("");
+  const [execMethod,   setExecMethod]   = useState("navigate_through_poses"); // navigate_through_poses | follow_waypoints | sequential
+  const [waypointProgress, setWaypointProgress] = useState({ current: 0, total: 0 });
+  const sequentialRef = useRef({ running: false, cancelled: false });
+  const activeGoalRef = useRef(null); // for action handle cancel
 
   // Style
   const [style,       setStyle]       = useState("zigzag");
@@ -223,43 +231,159 @@ export default function CoveragePage() {
     return () => { try { topic.unsubscribe(); } catch {} };
   }, [ros, isConnected]);
 
-  // ── Subscribe robot pose (amcl + odom fallback) ────────────────────────────
+  // ── Subscribe robot pose via /tf (map → base_link chain) ────────────────────
   useEffect(() => {
     if (!ros || !isConnected) return;
+
+    // Cleanup
     if (amclRef.current) { try { amclRef.current.unsubscribe(); } catch {} }
     if (odomRef.current) { try { odomRef.current.unsubscribe(); } catch {} }
 
-    let hasAmcl = false;
+    // Her child frame için en son transform'u sakla
+    // key = child_frame_id, value = { parent, tx, ty, tz, qx, qy, qz, qw }
+    const allTFs = {};
 
-    const amcl = new ROSLIB.Topic({
-      ros, name: "/amcl_pose",
-      messageType: "geometry_msgs/msg/PoseWithCovarianceStamped",
+    const tfTopic = new ROSLIB.Topic({
+      ros, name: "/tf",
+      messageType: "tf2_msgs/msg/TFMessage",
       throttle_rate: 100, queue_size: 1,
     });
-    amcl.subscribe((msg) => {
-      hasAmcl = true;
-      const p = msg.pose.pose;
-      setRobotPose({ x: p.position.x, y: p.position.y, yaw: quaternionToYaw(p.orientation) });
-      setPoseSource("amcl");
-    });
-    amclRef.current = amcl;
 
-    const odom = new ROSLIB.Topic({
-      ros, name: "/odom",
-      messageType: "nav_msgs/msg/Odometry",
-      throttle_rate: 100, queue_size: 1,
+    const tfStaticTopic = new ROSLIB.Topic({
+      ros, name: "/tf_static",
+      messageType: "tf2_msgs/msg/TFMessage",
+      throttle_rate: 1000, queue_size: 1,
     });
-    odom.subscribe((msg) => {
-      if (hasAmcl) return;
-      const p = msg.pose.pose;
-      setRobotPose({ x: p.position.x, y: p.position.y, yaw: quaternionToYaw(p.orientation) });
-      setPoseSource("odom");
-    });
-    odomRef.current = odom;
+
+    const processTfMsg = (msg) => {
+      if (!msg?.transforms) return;
+      for (const t of msg.transforms) {
+        const child  = (t.child_frame_id || "").replace(/^\//, "");
+        const parent = (t.header?.frame_id || "").replace(/^\//, "");
+        if (!child || !parent) continue;
+
+        const tr = t.transform;
+        if (!tr?.translation || !tr?.rotation) continue;
+
+        allTFs[child] = {
+          parent,
+          tx: tr.translation.x,
+          ty: tr.translation.y,
+          tz: tr.translation.z,
+          qx: tr.rotation.x,
+          qy: tr.rotation.y,
+          qz: tr.rotation.z,
+          qw: tr.rotation.w,
+        };
+      }
+
+      // map → base_link zincirini bul
+      const targetFrame = allTFs["base_link"] ? "base_link"
+                        : allTFs["base_footprint"] ? "base_footprint"
+                        : null;
+      if (!targetFrame) return;
+
+      // Zinciri base_link'ten map'e doğru oluştur
+      const chain = [];
+      let current = targetFrame;
+      const visited = new Set();
+      while (current && current !== "map" && !visited.has(current)) {
+        visited.add(current);
+        const tf = allTFs[current];
+        if (!tf) break;
+        chain.push({ frame: current, ...tf });
+        current = tf.parent;
+      }
+
+      if (current !== "map") return; // map'e ulaşamadık
+
+      // --- Zincir hesaplaması ---
+      // chain = [base_link{parent:odom,...}, odom{parent:map,...}]
+      // Tersine çevir → [odom{parent:map,...}, base_link{parent:odom,...}]
+      // Her adımda: result = parent_transform * child_transform
+      //
+      // T_map_base = T_map_odom * T_odom_base
+      //
+      // Compose transforms: P_parent = R_parent * P_child + T_parent
+      chain.reverse();
+
+      let wx = 0, wy = 0, wyaw = 0;
+      const debugChain = [];
+
+      for (const tf of chain) {
+        const tfYaw = quaternionToYaw({ x: tf.qx, y: tf.qy, z: tf.qz, w: tf.qw });
+
+        const cosY = Math.cos(wyaw);
+        const sinY = Math.sin(wyaw);
+        const nx = wx + cosY * tf.tx - sinY * tf.ty;
+        const ny = wy + sinY * tf.tx + cosY * tf.ty;
+
+        debugChain.push({
+          from: tf.parent,
+          to: tf.frame,
+          raw: { x: tf.tx.toFixed(3), y: tf.ty.toFixed(3), yaw: (tfYaw * 180 / Math.PI).toFixed(1) },
+          accumulated: { x: nx.toFixed(3), y: ny.toFixed(3), yaw: ((wyaw + tfYaw) * 180 / Math.PI).toFixed(1) },
+        });
+
+        wx = nx;
+        wy = ny;
+        wyaw += tfYaw;
+      }
+
+      // Debug bilgisini kaydet
+      setTfDebug({
+        chain: debugChain,
+        result: { x: wx.toFixed(3), y: wy.toFixed(3), yaw: (wyaw * 180 / Math.PI).toFixed(1) },
+        frames: Object.keys(allTFs).length,
+        target: targetFrame,
+      });
+
+      setRobotPose({ x: wx, y: wy, yaw: wyaw });
+      setPoseSource(`tf/topic:map→${targetFrame}`);
+    };
+
+    tfTopic.subscribe(processTfMsg);
+    tfStaticTopic.subscribe(processTfMsg);
+
+    // ─── Fallback: amcl_pose (3 saniye sonra TF yoksa) ──────────────────────
+    const fallbackTimer = setTimeout(() => {
+      // TF çalışıyorsa fallback gerekmez
+      if (Object.keys(allTFs).length > 0) return;
+
+      console.log("[CoveragePage] TF verisi yok — amcl/odom fallback");
+
+      const amcl = new ROSLIB.Topic({
+        ros, name: "/amcl_pose",
+        messageType: "geometry_msgs/msg/PoseWithCovarianceStamped",
+        throttle_rate: 200, queue_size: 1,
+      });
+      amcl.subscribe((msg) => {
+        const p = msg.pose.pose;
+        setRobotPose({ x: p.position.x, y: p.position.y, yaw: quaternionToYaw(p.orientation) });
+        setPoseSource("amcl (fallback)");
+      });
+      amclRef.current = amcl;
+
+      const odom = new ROSLIB.Topic({
+        ros, name: "/odom",
+        messageType: "nav_msgs/msg/Odometry",
+        throttle_rate: 200, queue_size: 1,
+      });
+      odom.subscribe((msg) => {
+        if (amclRef.current) return; // amcl varsa odom kullanma
+        const p = msg.pose.pose;
+        setRobotPose({ x: p.position.x, y: p.position.y, yaw: quaternionToYaw(p.orientation) });
+        setPoseSource("odom ⚠ (map frame değil)");
+      });
+      odomRef.current = odom;
+    }, 3000);
 
     return () => {
-      try { amcl.unsubscribe(); } catch {}
-      try { odom.unsubscribe(); } catch {}
+      clearTimeout(fallbackTimer);
+      try { tfTopic.unsubscribe(); } catch {}
+      try { tfStaticTopic.unsubscribe(); } catch {}
+      try { if (amclRef.current) amclRef.current.unsubscribe(); } catch {}
+      try { if (odomRef.current) odomRef.current.unsubscribe(); } catch {}
     };
   }, [ros, isConnected]);
 
@@ -361,6 +485,7 @@ export default function CoveragePage() {
     if (robotPose) {
       const { cx: rx, cy: ry } = w2c(robotPose.x, robotPose.y);
       const arrowLen = 22;
+      // Canvas'ta y ekseni aşağı doğru olduğu için yaw'ı negatifle
       const ax = rx + arrowLen * Math.cos(-robotPose.yaw);
       const ay = ry + arrowLen * Math.sin(-robotPose.yaw);
       // Glow
@@ -464,10 +589,84 @@ export default function CoveragePage() {
       });
       setPageStatus(`✅ Goal Pose → (${wx.toFixed(2)}, ${wy.toFixed(2)}) θ:${(yaw * 180 / Math.PI).toFixed(1)}°`);
       setPageError("");
+      setHasActiveGoal(true);
       setTimeout(() => { try { topic.unadvertise(); } catch {} }, 500);
     } catch (err) {
       setPageError(`Goal Pose hatası: ${prettyErr(err)}`);
     }
+  }, [ros, isConnected]);
+
+  // ── Cancel goal pose → Nav2 cancel ────────────────────────────────────────
+  const cancelGoalPose = useCallback(() => {
+    if (!ros || !isConnected) { setPageError("ROS bağlı değil"); return; }
+
+    // Sequential mode iptal
+    if (sequentialRef.current.running) {
+      sequentialRef.current.cancelled = true;
+    }
+
+    // ActionHandle varsa cancel et
+    if (activeGoalRef.current) {
+      try {
+        activeGoalRef.current.cancelGoal();
+      } catch (err) {
+        console.warn("ActionHandle cancel failed:", err);
+      }
+      activeGoalRef.current = null;
+    }
+
+    // Yöntem 1: navigate_through_poses action cancel
+    try {
+      const cancelSrv = new ROSLIB.Service({
+        ros, name: "/navigate_through_poses/_action/cancel_goal",
+        serviceType: "action_msgs/srv/CancelGoal",
+      });
+      cancelSrv.callService(
+        { goal_info: { goal_id: { uuid: [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0] }, stamp: { sec: 0, nanosec: 0 } } },
+        () => {}, () => {}
+      );
+    } catch {}
+
+    // Yöntem 2: navigate_to_pose action cancel (sequential mode veya tek goal)
+    try {
+      const cancelSrv2 = new ROSLIB.Service({
+        ros, name: "/navigate_to_pose/_action/cancel_goal",
+        serviceType: "action_msgs/srv/CancelGoal",
+      });
+      cancelSrv2.callService(
+        { goal_info: { goal_id: { uuid: [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0] }, stamp: { sec: 0, nanosec: 0 } } },
+        () => {}, () => {}
+      );
+    } catch {}
+
+    // Yöntem 3: follow_waypoints action cancel
+    try {
+      const cancelSrv3 = new ROSLIB.Service({
+        ros, name: "/follow_waypoints/_action/cancel_goal",
+        serviceType: "action_msgs/srv/CancelGoal",
+      });
+      cancelSrv3.callService(
+        { goal_info: { goal_id: { uuid: [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0] }, stamp: { sec: 0, nanosec: 0 } } },
+        () => {}, () => {}
+      );
+    } catch {}
+
+    // Yöntem 4: Boş cmd_vel gönder (robotu durdur)
+    try {
+      const cmdVelTopic = new ROSLIB.Topic({
+        ros, name: "/cmd_vel",
+        messageType: "geometry_msgs/msg/Twist", queue_size: 1,
+      });
+      cmdVelTopic.publish({ linear: { x: 0, y: 0, z: 0 }, angular: { x: 0, y: 0, z: 0 } });
+      setTimeout(() => { try { cmdVelTopic.unadvertise(); } catch {} }, 500);
+    } catch {}
+
+    setPageStatus("⏹ Goal iptal edildi — robot durduruluyor");
+    setPageError("");
+    setHasActiveGoal(false);
+    setExecStatus("idle");
+    setExecFeedback("İptal edildi");
+    setWaypointProgress({ current: 0, total: 0 });
   }, [ros, isConnected]);
 
   // ── Publish polygon ────────────────────────────────────────────────────────
@@ -530,43 +729,280 @@ export default function CoveragePage() {
     );
   }, [ros, isConnected]);
 
-  // ── Execute path ──────────────────────────────────────────────────────────
-  // CoverageExecutorNode'un auto_execute:true ayarıyla /coverage/path'i republish ediyoruz.
-  // Bu republish → executor'un onPath() → Nav2 FollowPath action'ı tetikler.
-  const executePath = useCallback(() => {
-    if (!ros || !isConnected) { setPageError("ROS bağlı değil"); return; }
-    if (!pathMsg || pathMsg.poses.length < 2) { setPageError("Path yok — önce Polygon Gönder"); return; }
+  // ── Helper: preview path → PoseStamped array ────────────────────────────────
+  const previewPathToPoses = useCallback(() => {
+    if (previewPath.length < 2) return [];
+    return previewPath.map((pt, i) => {
+      // Yönü bir sonraki noktaya doğru hesapla
+      let yaw = 0;
+      if (i < previewPath.length - 1) {
+        const dx = previewPath[i + 1].x - pt.x;
+        const dy = previewPath[i + 1].y - pt.y;
+        yaw = Math.atan2(dy, dx);
+      } else if (i > 0) {
+        const dx = pt.x - previewPath[i - 1].x;
+        const dy = pt.y - previewPath[i - 1].y;
+        yaw = Math.atan2(dy, dx);
+      }
+      const q = yawToQuaternion(yaw);
+      return {
+        header: { frame_id: "map", stamp: { sec: Math.floor(Date.now() / 1000), nanosec: 0 } },
+        pose: { position: { x: pt.x, y: pt.y, z: 0.0 }, orientation: q },
+      };
+    });
+  }, [previewPath]);
 
-    setExecStatus("sending");
-    setExecFeedback("Republish ediliyor...");
-    setPageError("");
+  // ── Get poses to execute (ROS path or preview path) ────────────────────────
+  const getExecutionPoses = useCallback(() => {
+    // Önce ROS'tan gelen path'i dene
+    if (pathMsg?.poses?.length >= 2) return pathMsg.poses;
+    // Yoksa preview path'i kullan
+    const poses = previewPathToPoses();
+    if (poses.length >= 2) return poses;
+    return null;
+  }, [pathMsg, previewPathToPoses]);
+
+  // ── Execute: NavigateThroughPoses action ─────────────────────────────────────
+  const executeNavigateThroughPoses = useCallback((poses) => {
+    setExecFeedback(`${poses.length} waypoint → NavigateThroughPoses...`);
+
+    // roslib 2.x ROS2 action desteği
+    try {
+      // Yöntem 1: ROSLIB.ActionHandle (roslib 2.x)
+      if (ROSLIB.ActionHandle) {
+        const actionClient = new ROSLIB.ActionHandle({
+          ros,
+          name: "/navigate_through_poses",
+          actionType: "nav2_msgs/action/NavigateThroughPoses",
+        });
+
+        const goalMsg = { poses, behavior_tree: "" };
+
+        activeGoalRef.current = actionClient;
+
+        actionClient.sendGoal(
+          goalMsg,
+          (result) => {
+            // Result callback
+            setExecStatus("done");
+            setExecFeedback("✅ Navigasyon tamamlandı");
+            setPageStatus("✅ Coverage path tamamlandı");
+            setHasActiveGoal(false);
+            activeGoalRef.current = null;
+          },
+          (feedback) => {
+            // Feedback callback
+            const remaining = feedback?.number_of_poses_remaining;
+            if (remaining !== undefined) {
+              const done = poses.length - remaining;
+              setWaypointProgress({ current: done, total: poses.length });
+              setExecFeedback(`🏃 ${done}/${poses.length} waypoint tamamlandı`);
+              setExecStatus("running");
+            }
+          }
+        );
+
+        setExecStatus("accepted");
+        setExecFeedback(`✅ ${poses.length} waypoint Nav2'ye gönderildi`);
+        setPageStatus("🏃 NavigateThroughPoses çalışıyor...");
+        setHasActiveGoal(true);
+        return true;
+      }
+    } catch (err) {
+      console.warn("ActionHandle not available:", err);
+    }
+
+    // Yöntem 2: Action'ın send_goal service'ini doğrudan çağır
+    try {
+      const sendGoalSrv = new ROSLIB.Service({
+        ros,
+        name: "/navigate_through_poses/_action/send_goal",
+        serviceType: "nav2_msgs/action/NavigateThroughPoses_SendGoal",
+      });
+      sendGoalSrv.callService(
+        { goal: { poses, behavior_tree: "" } },
+        (res) => {
+          if (res.accepted) {
+            setExecStatus("running");
+            setExecFeedback(`✅ Nav2 kabul etti — ${poses.length} waypoint`);
+            setPageStatus("🏃 NavigateThroughPoses çalışıyor");
+            setHasActiveGoal(true);
+          } else {
+            setExecStatus("error");
+            setPageError("Nav2 goal'u reddetti");
+          }
+        },
+        (err) => {
+          console.warn("NavigateThroughPoses service failed:", err);
+          setPageError(`NavigateThroughPoses hatası: ${prettyErr(err)} — FollowWaypoints denenecek`);
+          // Fallback to FollowWaypoints
+          executeFollowWaypoints(poses);
+        }
+      );
+      return true;
+    } catch (err) {
+      console.warn("NavigateThroughPoses call failed:", err);
+      return false;
+    }
+  }, [ros]);
+
+  // ── Execute: FollowWaypoints action ────────────────────────────────────────
+  const executeFollowWaypoints = useCallback((poses) => {
+    setExecFeedback(`${poses.length} waypoint → FollowWaypoints...`);
 
     try {
-      const topic = new ROSLIB.Topic({
-        ros, name: pathTopicName, messageType: "nav_msgs/msg/Path", queue_size: 1,
+      const sendGoalSrv = new ROSLIB.Service({
+        ros,
+        name: "/follow_waypoints/_action/send_goal",
+        serviceType: "nav2_msgs/action/FollowWaypoints_SendGoal",
       });
-      topic.publish({
-        header: {
-          frame_id: pathMsg.header?.frame_id || "map",
-          stamp: { sec: Math.floor(Date.now() / 1000), nanosec: (Date.now() % 1000) * 1e6 },
+      sendGoalSrv.callService(
+        { goal: { poses } },
+        (res) => {
+          if (res.accepted) {
+            setExecStatus("running");
+            setExecFeedback(`✅ FollowWaypoints kabul etti — ${poses.length} wp`);
+            setPageStatus("🏃 FollowWaypoints çalışıyor");
+            setHasActiveGoal(true);
+          } else {
+            setExecStatus("error");
+            setPageError("FollowWaypoints reddetti — Sequential deneyin");
+          }
         },
-        poses: pathMsg.poses,
-      });
-      setExecStatus("accepted");
-      setExecFeedback(`${pathMsg.poses.length} waypoint → CoverageExecutorNode → Nav2`);
-      setPageStatus("✅ Path Nav2 FollowPath action'a gönderildi");
-      setTimeout(() => { try { topic.unadvertise(); } catch {} }, 500);
+        (err) => {
+          console.warn("FollowWaypoints service failed:", err);
+          setPageError(`FollowWaypoints hatası: ${prettyErr(err)} — Sequential modu deneyin`);
+          setExecStatus("error");
+        }
+      );
+      return true;
     } catch (err) {
-      setExecStatus("error");
-      setPageError(`Execute hatası: ${prettyErr(err)}`);
+      console.warn("FollowWaypoints call failed:", err);
+      return false;
     }
-  }, [ros, isConnected, pathMsg]);
+  }, [ros]);
+
+  // ── Execute: Sequential goal_pose (waypoint by waypoint) ──────────────────
+  const executeSequential = useCallback(async (poses) => {
+    sequentialRef.current = { running: true, cancelled: false };
+    setExecStatus("running");
+    setHasActiveGoal(true);
+    setWaypointProgress({ current: 0, total: poses.length });
+
+    const goalTopic = new ROSLIB.Topic({
+      ros, name: goalPoseTopic,
+      messageType: "geometry_msgs/msg/PoseStamped", queue_size: 1,
+    });
+
+    // Robot pozisyonuyla waypoint mesafesini kontrol et
+    const distToRobot = (pose) => {
+      if (!robotPose) return Infinity;
+      const dx = pose.pose.position.x - robotPose.x;
+      const dy = pose.pose.position.y - robotPose.y;
+      return Math.sqrt(dx * dx + dy * dy);
+    };
+
+    const ARRIVAL_THRESHOLD = 0.5; // metre — hedefe yakınlık eşiği
+    const CHECK_INTERVAL = 500;    // ms — konum kontrol aralığı
+    const WAYPOINT_TIMEOUT = 60000; // ms — tek waypoint timeout
+
+    for (let i = 0; i < poses.length; i++) {
+      if (sequentialRef.current.cancelled) {
+        setExecStatus("idle");
+        setExecFeedback("⏹ İptal edildi");
+        setPageStatus("⏹ Sequential navigasyon iptal edildi");
+        setHasActiveGoal(false);
+        break;
+      }
+
+      const pose = poses[i];
+      setWaypointProgress({ current: i, total: poses.length });
+      setExecFeedback(`🏃 Waypoint ${i + 1}/${poses.length} — hedefe gidiyor...`);
+
+      // Waypoint'i /goal_pose'a gönder
+      goalTopic.publish({
+        header: { frame_id: "map", stamp: { sec: Math.floor(Date.now() / 1000), nanosec: (Date.now() % 1000) * 1e6 } },
+        pose: pose.pose,
+      });
+
+      // Roboun hedefe ulaşmasını bekle
+      const arrived = await new Promise((resolve) => {
+        const startTime = Date.now();
+        const checker = setInterval(() => {
+          if (sequentialRef.current.cancelled) {
+            clearInterval(checker);
+            resolve(false);
+            return;
+          }
+          const dist = distToRobot(pose);
+          if (dist < ARRIVAL_THRESHOLD) {
+            clearInterval(checker);
+            resolve(true);
+            return;
+          }
+          if (Date.now() - startTime > WAYPOINT_TIMEOUT) {
+            clearInterval(checker);
+            resolve(true); // timeout → sonraki waypoint'e geç
+            return;
+          }
+        }, CHECK_INTERVAL);
+      });
+
+      if (!arrived && sequentialRef.current.cancelled) break;
+
+      setWaypointProgress({ current: i + 1, total: poses.length });
+    }
+
+    try { goalTopic.unadvertise(); } catch {}
+    sequentialRef.current.running = false;
+
+    if (!sequentialRef.current.cancelled) {
+      setExecStatus("done");
+      setExecFeedback(`✅ ${poses.length} waypoint tamamlandı`);
+      setPageStatus("✅ Sequential navigasyon tamamlandı");
+      setHasActiveGoal(false);
+    }
+  }, [ros, robotPose, goalPoseTopic]);
+
+  // ── Main execute entry point ──────────────────────────────────────────────
+  const executePath = useCallback(() => {
+    if (!ros || !isConnected) { setPageError("ROS bağlı değil"); return; }
+
+    const poses = getExecutionPoses();
+    if (!poses) {
+      setPageError("Path yok — önce alan seçin ve Polygon Gönder yapın, ya da 4 nokta seçerek preview path oluşturun");
+      return;
+    }
+
+    setExecStatus("sending");
+    setExecFeedback(`${poses.length} waypoint hazırlanıyor...`);
+    setPageError("");
+    setWaypointProgress({ current: 0, total: poses.length });
+
+    if (execMethod === "navigate_through_poses") {
+      const ok = executeNavigateThroughPoses(poses);
+      if (!ok) {
+        setPageError("NavigateThroughPoses başarısız — FollowWaypoints veya Sequential deneyin");
+        setExecStatus("error");
+      }
+    } else if (execMethod === "follow_waypoints") {
+      const ok = executeFollowWaypoints(poses);
+      if (!ok) {
+        setPageError("FollowWaypoints başarısız — Sequential deneyin");
+        setExecStatus("error");
+      }
+    } else if (execMethod === "sequential") {
+      executeSequential(poses);
+    }
+  }, [ros, isConnected, execMethod, getExecutionPoses, executeNavigateThroughPoses, executeFollowWaypoints, executeSequential]);
 
   const clearAll = () => {
+    sequentialRef.current = { running: false, cancelled: true };
     setPoints([]); setPathMsg(null);
     setExecStatus("idle"); setExecFeedback("");
     goalDragRef.current = null; setGoalDragEnd(null);
-    setActiveMode(MODE_IDLE);
+    setActiveMode(MODE_IDLE); setHasActiveGoal(false);
+    setWaypointProgress({ current: 0, total: 0 });
   };
 
   // ── Cursor ─────────────────────────────────────────────────────────────────
@@ -577,7 +1013,7 @@ export default function CoveragePage() {
     idle:     "🚀 Path Çalıştır (Nav2)",
     sending:  "⏳ Gönderiliyor...",
     accepted: "✅ Nav2'ye Gönderildi",
-    running:  "🏃 Araç Hareket Ediyor",
+    running:  `🏃 ${waypointProgress.current}/${waypointProgress.total} Waypoint`,
     done:     "✅ Tamamlandı",
     error:    "❌ Hata — Tekrar Dene",
   };
@@ -715,14 +1151,38 @@ export default function CoveragePage() {
                     <div>x: {robotPose.x.toFixed(3)} m</div>
                     <div>y: {robotPose.y.toFixed(3)} m</div>
                     <div>θ: {(robotPose.yaw * 180 / Math.PI).toFixed(1)}°</div>
-                    <div style={{ color: "#475569", fontSize: "0.55rem" }}>src: {poseSource}</div>
+                    <div style={{ color: poseSource.startsWith("tf:") ? "#10b981" : poseSource.includes("odom") ? "#f97316" : "#60a5fa", fontSize: "0.55rem", fontWeight: "600" }}>
+                      src: {poseSource}
+                    </div>
+                    {poseSource.includes("odom") && !poseSource.startsWith("tf:") && (
+                      <div style={{ color: "#f97316", fontSize: "0.5rem", marginTop: "0.15rem" }}>
+                        ⚠ odom frame — konum yanlış olabilir
+                      </div>
+                    )}
                   </div>
                 : <div style={{ fontSize: "0.6rem", color: "#334155" }}>
                     Pose alınamadı<br/>
-                    <span style={{ color: "#1e293b" }}>/amcl_pose | /odom</span>
+                    <span style={{ color: "#1e293b" }}>TF: map→base_link<br/>/amcl_pose | /odom</span>
                   </div>
               }
             </div>
+
+            {/* TF Debug */}
+            {tfDebug && (
+              <div style={{ ...crdS, border: "1px solid #1e3a5f" }}>
+                <div style={lblS}>TF DEBUG ({tfDebug.frames} frames)</div>
+                {tfDebug.chain?.map((step, i) => (
+                  <div key={i} style={{ fontSize: "0.5rem", color: "#60a5fa", lineHeight: "1.6", borderBottom: "1px solid #0a1020", paddingBottom: "0.2rem", marginBottom: "0.2rem" }}>
+                    <div style={{ color: "#94a3b8" }}>{step.from} → {step.to}</div>
+                    <div>raw: x={step.raw.x} y={step.raw.y} θ={step.raw.yaw}°</div>
+                    <div style={{ color: "#10b981" }}>acc: x={step.accumulated.x} y={step.accumulated.y} θ={step.accumulated.yaw}°</div>
+                  </div>
+                ))}
+                <div style={{ fontSize: "0.55rem", color: "#fbbf24", fontWeight: "700", marginTop: "0.15rem" }}>
+                  Sonuç: ({tfDebug.result.x}, {tfDebug.result.y}) θ:{tfDebug.result.yaw}°
+                </div>
+              </div>
+            )}
 
             {/* Path info */}
             {pathMsg?.poses?.length > 0 && (
@@ -736,30 +1196,105 @@ export default function CoveragePage() {
 
             <div style={{ flex: 1 }} />
 
+            {/* Execution Method */}
+            <div style={crdS}>
+              <div style={lblS}>NAV2 YÖNTEMİ</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: "0.2rem" }}>
+                {[
+                  { key: "navigate_through_poses", label: "NavigateThroughPoses", desc: "Tüm waypoint'ler tek seferde" },
+                  { key: "follow_waypoints",       label: "FollowWaypoints",       desc: "Nav2 waypoint takipçisi" },
+                  { key: "sequential",             label: "Sequential (Tek tek)",   desc: "Her noktaya sırayla git" },
+                ].map(m => (
+                  <button key={m.key} onClick={() => setExecMethod(m.key)}
+                    style={{
+                      padding: "0.35rem 0.5rem", textAlign: "left",
+                      background: execMethod === m.key ? "rgba(37,99,235,0.15)" : "#0a1020",
+                      border: `1px solid ${execMethod === m.key ? "#3b82f6" : "#162032"}`,
+                      borderRadius: "0.25rem",
+                      color: execMethod === m.key ? "#60a5fa" : "#475569",
+                      cursor: "pointer", fontSize: "0.58rem", fontWeight: execMethod === m.key ? "700" : "400",
+                    }}>
+                    {execMethod === m.key ? "◉" : "○"} {m.label}
+                    <div style={{ fontSize: "0.5rem", color: "#334155", marginTop: "0.1rem" }}>{m.desc}</div>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Waypoint Progress */}
+            {waypointProgress.total > 0 && (
+              <div style={{ ...crdS, border: "1px solid #1d4ed8" }}>
+                <div style={lblS}>İLERLEME</div>
+                <div style={{ fontSize: "0.7rem", fontWeight: "700", color: "#60a5fa" }}>
+                  {waypointProgress.current}/{waypointProgress.total}
+                </div>
+                <div style={{ marginTop: "0.3rem", height: "4px", background: "#0a1020", borderRadius: "2px", overflow: "hidden" }}>
+                  <div style={{
+                    width: `${waypointProgress.total > 0 ? (waypointProgress.current / waypointProgress.total) * 100 : 0}%`,
+                    height: "100%", background: "#3b82f6", borderRadius: "2px", transition: "width 0.3s",
+                  }} />
+                </div>
+                {execFeedback && <div style={{ fontSize: "0.55rem", color: "#60a5fa", marginTop: "0.2rem" }}>{execFeedback}</div>}
+              </div>
+            )}
+
             {/* Buttons */}
             <div style={{ display: "flex", flexDirection: "column", gap: "0.35rem" }}>
               <button onClick={publishPolygon} disabled={points.length!==4||!isConnected}
                 style={{ ...btnS(points.length===4&&isConnected?"#065f46":"#162032"), padding: "0.7rem", fontSize: "0.75rem", opacity: points.length===4&&isConnected?1:0.4 }}>
                 📤 Polygon Gönder
               </button>
-              <button onClick={executePath} disabled={!pathMsg||pathMsg.poses.length<2||!isConnected}
-                style={{ ...btnS(execBtnColor[execStatus]), padding: "0.7rem", fontSize: "0.75rem", fontWeight: "800", opacity: pathMsg?.poses?.length>1&&isConnected?1:0.4, transition: "background 0.3s" }}>
+              <button onClick={executePath}
+                disabled={!isConnected || execStatus === "running" || execStatus === "sending" || (!pathMsg?.poses?.length && previewPath.length < 2)}
+                style={{
+                  ...btnS(execBtnColor[execStatus]), padding: "0.7rem", fontSize: "0.75rem", fontWeight: "800",
+                  opacity: isConnected && (pathMsg?.poses?.length > 1 || previewPath.length >= 2) ? 1 : 0.4,
+                  transition: "background 0.3s",
+                }}>
                 {execBtnLabel[execStatus]}
               </button>
+
+              {/* ── CANCEL GOAL BUTTON ── */}
+              <button onClick={cancelGoalPose} disabled={!isConnected || !hasActiveGoal}
+                style={{
+                  ...btnS(hasActiveGoal && isConnected ? "#991b1b" : "#162032", hasActiveGoal && isConnected ? "1px solid #ef4444" : "1px solid #1e293b"),
+                  padding: "0.7rem", fontSize: "0.75rem", fontWeight: "800",
+                  opacity: hasActiveGoal && isConnected ? 1 : 0.35,
+                  transition: "all 0.3s",
+                  color: hasActiveGoal ? "#fca5a5" : "#475569",
+                }}>
+                ⛔ Goal İptal Et
+              </button>
+
               <button onClick={clearAll}
                 style={{ ...btnS("transparent","1px solid #1e293b"), padding: "0.4rem", fontSize: "0.65rem", color: "#475569" }}>
                 🗑 Temizle
               </button>
             </div>
 
+            {/* Source info */}
+            <div style={{ fontSize: "0.5rem", color: "#1e293b", lineHeight: "1.6" }}>
+              {pathMsg?.poses?.length ? (
+                <span style={{ color: "#10b981" }}>✓ ROS path ({pathMsg.poses.length} wp)</span>
+              ) : previewPath.length >= 2 ? (
+                <span style={{ color: "#3b82f6" }}>✓ Preview path ({previewPath.length} wp)</span>
+              ) : (
+                <span>Path yok — alan seçin</span>
+              )}
+            </div>
+
             {/* Flow guide */}
             <div style={{ fontSize: "0.55rem", color: "#334155", lineHeight: "1.9", borderTop: "1px solid #162032", paddingTop: "0.4rem" }}>
               <div style={{ color: "#475569", fontWeight: "700" }}>COVERAGE AKIŞI:</div>
-              <div>1 → Stil seç</div>
-              <div>2 → Alan Seçimi (4 nokta)</div>
-              <div>3 → Polygon Gönder</div>
-              <div>4 → Path Çalıştır</div>
-              <div style={{ marginTop: "0.3rem", color: "#334155" }}>TEK HEDEF: 2D Nav Goal</div>
+              <div>1 → Stil seç + Alan seç (4 nokta)</div>
+              <div>2 → Nav2 yöntemi seç</div>
+              <div>3 → 🚀 Path Çalıştır</div>
+              <div style={{ marginTop: "0.2rem", color: "#3b82f6", fontSize: "0.5rem" }}>
+                💡 Polygon Gönder opsiyonel — ROS<br/>
+                planner node yoksa preview path<br/>
+                otomatik kullanılır
+              </div>
+              <div style={{ marginTop: "0.3rem", color: "#ef4444" }}>⛔ İptal: Goal İptal Et</div>
             </div>
           </div>
 

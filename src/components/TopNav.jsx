@@ -13,14 +13,18 @@ export default function TopNav() {
   });
 
   return (
-    <div style={{ display: "flex", gap: 10, padding: 12, borderBottom: "1px solid rgba(0,0,0,0.12)", flexWrap: "wrap" }}>
+    <div style={{ display: "flex", gap: 10, padding: 12, borderBottom: "1px solid rgba(0,0,0,0.12)" }}>
       <Link to="/" style={active("/")}>Teleop</Link>
       <Link to="/map" style={active("/map")}>Live Map</Link>
       <Link to="/human-snapshots" style={active("/human-snapshots")}>Human</Link>
       <Link to="/health" style={active("/health")}>Health</Link>
       <Link to="/coverage" style={active("/coverage")}>Coverage</Link>
-      <Link to="/piezo" style={active("/piezo")}>🎯 Piezo</Link>
-      <Link to="/terminal" style={active("/terminal")}>💻 Terminal</Link>
+      <Link to="/piezo" style={active("/piezo")}>Piezo</Link>
+      <Link to="/tasks" style={active("/tasks")}>Task Manager</Link>
+      <Link to="/terminal" style={active("/terminal")}>Terminal</Link>
+
+
+
     </div>
   );
 }

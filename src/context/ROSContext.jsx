@@ -11,19 +11,14 @@ import * as ROSLIB from "roslib";
 
 const ROSContext = createContext(null);
 
-// --- Varsayılan IP ayarı (localStorage'dan okunur) ---
-const LS_URL_KEY = "rosbridge_url_v1";
 const DEFAULT_URL = `ws://${window.location.hostname || "localhost"}:9090`;
 
 function loadUrl() {
-  // Her zaman tarayıcının hostname'ini kullan — farklı ağlarda sorun çıkmasın
   return DEFAULT_URL;
 }
 
 function saveUrl(url) {
-  try {
-    localStorage.setItem(LS_URL_KEY, url);
-  } catch {}
+  try { localStorage.setItem("rosbridge_url_v1", url); } catch {}
 }
 
 export function ROSProvider({ children }) {
@@ -32,9 +27,6 @@ export function ROSProvider({ children }) {
   const [errorText, setErrorText] = useState("");
   const [isConnected, setIsConnected] = useState(false);
 
-  // ros nesnesini hem ref hem state'te tutuyoruz:
-  //   ref  → callback'ler içinde güncel değere erişmek için
-  //   state → değiştiğinde tüm consumer'ları re-render etmek için
   const rosRef = useRef(null);
   const [rosInstance, setRosInstance] = useState(null);
 
@@ -42,157 +34,212 @@ export function ROSProvider({ children }) {
   const mountedRef = useRef(true);
   const connectingRef = useRef(false);
 
-  // URL değişince localStorage'a yaz
+  // ══════════════════════════════════════════════════════════════════════════
+  // OPERASYON MODU — tüm sayfalar bunu paylaşır
+  // ══════════════════════════════════════════════════════════════════════════
+  const [operationMode, setOperationModeState] = useState("manual");
+  const modSubRef = useRef(null);
+
+  // /mod subscribe — dışarıdan gelen mod değişikliklerini yakala
   useEffect(() => {
-    saveUrl(rosbridgeUrl);
-  }, [rosbridgeUrl]);
+    const ros = rosRef.current;
+    if (!ros || !isConnected) return;
 
-  // --- Bağlantı kur ---
-  const connect = useCallback(
-    (url) => {
-      // Zaten bağlanıyorsak tekrar deneme
-      if (connectingRef.current) return;
+    if (modSubRef.current) {
+      try { modSubRef.current.unsubscribe(); } catch {}
+    }
 
-      // ROSLIB npm'den import edildi, her zaman mevcut
+    const topic = new ROSLIB.Topic({
+      ros,
+      name: "/mod",
+      messageType: "std_msgs/msg/String",
+      throttle_rate: 200,
+      queue_length: 1,
+    });
 
-      // Eski bağlantıyı temiz kapat
-      if (rosRef.current) {
-        try {
-          rosRef.current.removeAllListeners();
-          rosRef.current.close();
-        } catch {}
-        rosRef.current = null;
-        // State sadece gerekliyse güncelle (gereksiz re-render önle)
-        setRosInstance((prev) => prev ? null : prev);
-        setIsConnected((prev) => prev ? false : prev);
+    topic.subscribe((msg) => {
+      const val = (msg.data || "").toLowerCase().trim();
+      if (["manual", "autonomous", "task"].includes(val)) {
+        setOperationModeState(val);
       }
+    });
 
-      connectingRef.current = true;
-      setStatus((prev) => prev === "Bağlanıyor..." ? prev : "Bağlanıyor...");
-      setErrorText((prev) => prev ? "" : prev);
+    modSubRef.current = topic;
+    return () => { try { topic.unsubscribe(); } catch {} };
+  }, [rosInstance, isConnected]);
 
-      const ros = new ROSLIB.Ros({ url });
+  // Mod değiştir + /mod publish + geçiş aksiyonları
+  const setOperationMode = useCallback((newMode) => {
+    const ros = rosRef.current;
+    if (!ros || !isConnected) {
+      setOperationModeState(newMode);
+      return;
+    }
 
-      ros.on("connection", () => {
-        if (!mountedRef.current) return;
-        console.log("[ROSContext] ✅ Bağlandı!");
-        connectingRef.current = false;
-        rosRef.current = ros;
-        setRosInstance(ros);
-        setIsConnected(true);
-        setStatus("Bağlandı");
-        setErrorText("");
+    const prevMode = operationMode;
+    setOperationModeState(newMode);
 
-        // Reconnect timer varsa iptal et
-        if (reconnectTimer.current) {
-          clearTimeout(reconnectTimer.current);
-          reconnectTimer.current = null;
-        }
+    // 1) /mod publish
+    try {
+      const modTopic = new ROSLIB.Topic({
+        ros, name: "/mod",
+        messageType: "std_msgs/msg/String",
+        queue_size: 1,
       });
+      modTopic.publish({ data: newMode });
+      setTimeout(() => { try { modTopic.unadvertise(); } catch {} }, 500);
+    } catch {}
 
-      ros.on("close", () => {
-        if (!mountedRef.current) return;
-        connectingRef.current = false;
-        rosRef.current = null;
-        setRosInstance((prev) => prev ? null : prev);
-        setIsConnected((prev) => {
-          if (prev) {
-            console.log("[ROSContext] 🔌 Bağlantı koptu");
-            setStatus("Bağlantı koptu");
-          }
-          return false;
-        });
+    // 2) Otonom/Task → Manuel geçişi: Nav2 goal iptal et
+    //    Nav2 /cmd_vel yayınını kesmesi için aktif navigasyonu durdurmalıyız
+    if (newMode === "manual" && (prevMode === "autonomous" || prevMode === "task")) {
+      cancelNav2Goal(ros);
+    }
 
-        // Otomatik reconnect (5 saniye sonra)
-        if (!reconnectTimer.current) {
-          reconnectTimer.current = setTimeout(() => {
-            reconnectTimer.current = null;
-            if (mountedRef.current) {
-              connect(url);
-            }
-          }, 5000);
-        }
+    console.log(`[ROSContext] Mode: ${prevMode} → ${newMode}`);
+  }, [rosInstance, isConnected, operationMode]);
+
+  // Nav2 goal iptal — navigate_to_pose action cancel
+  const cancelNav2Goal = useCallback((ros) => {
+    if (!ros) return;
+    try {
+      // Nav2 FollowPath cancel
+      const cancelTopic = new ROSLIB.Topic({
+        ros,
+        name: "/navigate_to_pose/_action/cancel",
+        messageType: "action_msgs/msg/GoalID",
+        queue_size: 1,
       });
+      // Boş GoalID = tüm aktif goal'ları iptal et
+      cancelTopic.publish({});
+      setTimeout(() => { try { cancelTopic.unadvertise(); } catch {} }, 500);
+      console.log("[ROSContext] Nav2 goal cancel sent");
+    } catch (e) {
+      console.warn("[ROSContext] Nav2 cancel error:", e);
+    }
 
-      ros.on("error", (e) => {
-        if (!mountedRef.current) return;
-        // error event'i close'dan ÖNCE gelir — connectingRef'i burada sıfırlama
-        // close handler zaten sıfırlayacak ve reconnect planlayacak
-        const msg = e?.message || (e?.type === "error" ? "ROSBridge bağlantısı kurulamadı" : String(e));
-        setStatus((prev) => prev === "Bağlantı hatası" ? prev : "Bağlantı hatası");
-        setErrorText((prev) => prev === msg ? prev : msg);
+    // Ek güvenlik: /cmd_vel'e bir kez sıfır twist gönder
+    // Bu sayede mux'taki son Nav2 mesajı sıfırlanır
+    try {
+      const cmdTopic = new ROSLIB.Topic({
+        ros,
+        name: "/cmd_vel",
+        messageType: "geometry_msgs/msg/Twist",
+        queue_size: 1,
       });
+      cmdTopic.publish({
+        linear: { x: 0, y: 0, z: 0 },
+        angular: { x: 0, y: 0, z: 0 },
+      });
+      setTimeout(() => { try { cmdTopic.unadvertise(); } catch {} }, 500);
+    } catch {}
+  }, []);
 
-      // ❗ rosRef'i tut ama state'i GÜNCELLEME — sadece "connection" event'inde güncelle
+  // ══════════════════════════════════════════════════════════════════════════
+  // BAĞLANTI YÖNETİMİ (mevcut kod — değişiklik yok)
+  // ══════════════════════════════════════════════════════════════════════════
+
+  useEffect(() => { saveUrl(rosbridgeUrl); }, [rosbridgeUrl]);
+
+  const connect = useCallback((url) => {
+    if (connectingRef.current) return;
+
+    if (rosRef.current) {
+      try { rosRef.current.removeAllListeners(); rosRef.current.close(); } catch {}
+      rosRef.current = null;
+      setRosInstance((prev) => prev ? null : prev);
+      setIsConnected((prev) => prev ? false : prev);
+    }
+
+    connectingRef.current = true;
+    setStatus((prev) => prev === "Bağlanıyor..." ? prev : "Bağlanıyor...");
+    setErrorText((prev) => prev ? "" : prev);
+
+    const ros = new ROSLIB.Ros({ url });
+
+    ros.on("connection", () => {
+      if (!mountedRef.current) return;
+      console.log("[ROSContext] ✅ Bağlandı!");
+      connectingRef.current = false;
       rosRef.current = ros;
-    },
-    [] // connect fonksiyonu sabit, url parametre olarak alıyor
-  );
+      setRosInstance(ros);
+      setIsConnected(true);
+      setStatus("Bağlandı");
+      setErrorText("");
+      if (reconnectTimer.current) { clearTimeout(reconnectTimer.current); reconnectTimer.current = null; }
+    });
 
-  // --- URL değişince bağlan ---
+    ros.on("close", () => {
+      if (!mountedRef.current) return;
+      connectingRef.current = false;
+      rosRef.current = null;
+      setRosInstance((prev) => prev ? null : prev);
+      setIsConnected((prev) => {
+        if (prev) { console.log("[ROSContext] 🔌 Bağlantı koptu"); setStatus("Bağlantı koptu"); }
+        return false;
+      });
+      if (!reconnectTimer.current) {
+        reconnectTimer.current = setTimeout(() => {
+          reconnectTimer.current = null;
+          if (mountedRef.current) connect(url);
+        }, 5000);
+      }
+    });
+
+    ros.on("error", (e) => {
+      if (!mountedRef.current) return;
+      const msg = e?.message || (e?.type === "error" ? "ROSBridge bağlantısı kurulamadı" : String(e));
+      setStatus((prev) => prev === "Bağlantı hatası" ? prev : "Bağlantı hatası");
+      setErrorText((prev) => prev === msg ? prev : msg);
+    });
+
+    rosRef.current = ros;
+  }, []);
+
   useEffect(() => {
     mountedRef.current = true;
-
     connect(rosbridgeUrl);
-
     return () => {
-      // StrictMode cleanup: sadece timer'ı temizle, bağlantıyı KAPATMA
-      // Gerçek unmount'ta (provider kaldırılınca) bağlantı kapanır
       mountedRef.current = false;
       connectingRef.current = false;
-
-      if (reconnectTimer.current) {
-        clearTimeout(reconnectTimer.current);
-        reconnectTimer.current = null;
-      }
+      if (reconnectTimer.current) { clearTimeout(reconnectTimer.current); reconnectTimer.current = null; }
     };
   }, [rosbridgeUrl, connect]);
 
-  // --- Tam unmount'ta bağlantıyı kapat ---
   useEffect(() => {
     return () => {
-      console.log("[ROSContext] Provider unmount — bağlantı kapatılıyor");
+      console.log("[ROSContext] Provider unmount");
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
       if (rosRef.current) {
-        try {
-          rosRef.current.removeAllListeners();
-          rosRef.current.close();
-        } catch {}
+        try { rosRef.current.removeAllListeners(); rosRef.current.close(); } catch {}
       }
     };
   }, []);
 
-  // --- Manuel yeniden bağlan butonu için ---
   const reconnect = useCallback(() => {
-    console.log("[ROSContext] Manuel reconnect tetiklendi");
-    // Her şeyi sıfırla
-    if (reconnectTimer.current) {
-      clearTimeout(reconnectTimer.current);
-      reconnectTimer.current = null;
-    }
-    // Eski bağlantıyı zorla kapat
+    console.log("[ROSContext] Manuel reconnect");
+    if (reconnectTimer.current) { clearTimeout(reconnectTimer.current); reconnectTimer.current = null; }
     if (rosRef.current) {
-      try {
-        rosRef.current.removeAllListeners();
-        rosRef.current.close();
-      } catch {}
+      try { rosRef.current.removeAllListeners(); rosRef.current.close(); } catch {}
       rosRef.current = null;
       setRosInstance(null);
       setIsConnected(false);
     }
     connectingRef.current = false;
-    // Kısa gecikmeyle yeniden bağlan
     setTimeout(() => connect(rosbridgeUrl), 300);
   }, [rosbridgeUrl, connect]);
 
   const value = {
-    ros: rosInstance,      // state tabanlı → değişince re-render olur
+    ros: rosInstance,
     isConnected,
     status,
     errorText,
     rosbridgeUrl,
-    setRosbridgeUrl,       // IP değiştirmek için
-    reconnect,             // manuel yeniden bağlan
+    setRosbridgeUrl,
+    reconnect,
+    // ── YENİ: Mod sistemi ──
+    operationMode,
+    setOperationMode,
   };
 
   return <ROSContext.Provider value={value}>{children}</ROSContext.Provider>;
