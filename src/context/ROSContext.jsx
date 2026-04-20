@@ -40,6 +40,11 @@ export function ROSProvider({ children }) {
   const [operationMode, setOperationModeState] = useState("manual");
   const modSubRef = useRef(null);
 
+  // ══════════════════════════════════════════════════════════════════════════
+  // HUMAN FOLLOW — tüm sayfalar bunu paylaşır
+  // ══════════════════════════════════════════════════════════════════════════
+  const [humanFollowEnabled, setHumanFollowEnabled] = useState(false);
+
   // /mod subscribe — dışarıdan gelen mod değişikliklerini yakala
   useEffect(() => {
     const ros = rosRef.current;
@@ -91,7 +96,6 @@ export function ROSProvider({ children }) {
     } catch {}
 
     // 2) Otonom/Task → Manuel geçişi: Nav2 goal iptal et
-    //    Nav2 /cmd_vel yayınını kesmesi için aktif navigasyonu durdurmalıyız
     if (newMode === "manual" && (prevMode === "autonomous" || prevMode === "task")) {
       cancelNav2Goal(ros);
     }
@@ -103,14 +107,12 @@ export function ROSProvider({ children }) {
   const cancelNav2Goal = useCallback((ros) => {
     if (!ros) return;
     try {
-      // Nav2 FollowPath cancel
       const cancelTopic = new ROSLIB.Topic({
         ros,
         name: "/navigate_to_pose/_action/cancel",
         messageType: "action_msgs/msg/GoalID",
         queue_size: 1,
       });
-      // Boş GoalID = tüm aktif goal'ları iptal et
       cancelTopic.publish({});
       setTimeout(() => { try { cancelTopic.unadvertise(); } catch {} }, 500);
       console.log("[ROSContext] Nav2 goal cancel sent");
@@ -118,8 +120,6 @@ export function ROSProvider({ children }) {
       console.warn("[ROSContext] Nav2 cancel error:", e);
     }
 
-    // Ek güvenlik: /cmd_vel'e bir kez sıfır twist gönder
-    // Bu sayede mux'taki son Nav2 mesajı sıfırlanır
     try {
       const cmdTopic = new ROSLIB.Topic({
         ros,
@@ -135,8 +135,34 @@ export function ROSProvider({ children }) {
     } catch {}
   }, []);
 
+  // Human Follow toggle — /human_follow/enable (std_msgs/Bool) publish eder
+  // Yeni state'i döner (HumanSnapshots bunu kullanır)
+  const toggleHumanFollow = useCallback(() => {
+    const ros = rosRef.current;
+    const next = !humanFollowEnabled;
+    setHumanFollowEnabled(next);
+
+    if (ros && isConnected) {
+      try {
+        const topic = new ROSLIB.Topic({
+          ros,
+          name: "/human_follow/enable",
+          messageType: "std_msgs/Bool",
+          queue_size: 1,
+        });
+        topic.publish({ data: next });
+        setTimeout(() => { try { topic.unadvertise(); } catch {} }, 500);
+        console.log(`[ROSContext] human_follow/enable → ${next}`);
+      } catch (e) {
+        console.warn("[ROSContext] toggleHumanFollow error:", e);
+      }
+    }
+
+    return next;
+  }, [humanFollowEnabled, isConnected]);
+
   // ══════════════════════════════════════════════════════════════════════════
-  // BAĞLANTI YÖNETİMİ (mevcut kod — değişiklik yok)
+  // BAĞLANTI YÖNETİMİ
   // ══════════════════════════════════════════════════════════════════════════
 
   useEffect(() => { saveUrl(rosbridgeUrl); }, [rosbridgeUrl]);
@@ -237,9 +263,12 @@ export function ROSProvider({ children }) {
     rosbridgeUrl,
     setRosbridgeUrl,
     reconnect,
-    // ── YENİ: Mod sistemi ──
+    // Mod sistemi
     operationMode,
     setOperationMode,
+    // Human Follow sistemi
+    humanFollowEnabled,
+    toggleHumanFollow,
   };
 
   return <ROSContext.Provider value={value}>{children}</ROSContext.Provider>;

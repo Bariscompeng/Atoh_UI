@@ -5,16 +5,16 @@ import * as ROSLIB from "roslib";
 
 const clamp = (v, min, max) => Math.min(max, Math.max(min, v));
 
-const BG      = "#04090f";
+const BG = "#04090f";
 const SURFACE = "#07111d";
-const SRF2    = "#0b1929";
-const BORDER  = "#0f2236";
+const SRF2 = "#0b1929";
+const BORDER = "#0f2236";
 const BORDER2 = "#162d46";
-const TEXT    = "#c8dde8";
-const TEXT2   = "#4a7a96";
-const TEXT3   = "#1e3a52";
-const ACCENT  = "#0ea5e9";
-const MONO    = "'JetBrains Mono','Fira Code',monospace";
+const TEXT = "#c8dde8";
+const TEXT2 = "#4a7a96";
+const TEXT3 = "#1e3a52";
+const ACCENT = "#0ea5e9";
+const MONO = "'JetBrains Mono','Fira Code',monospace";
 
 const btnStyle = (color, bg, border) => ({
   padding: "0.42rem 0.75rem", background: bg, border,
@@ -42,7 +42,7 @@ const ageLabel = (ts, key) => {
   if (!ts) return { text: "Veri yok", color: TEXT3 };
   const ageSec = (Date.now() - ts) / 1000;
   const stale = key === "battery" ? 300 : 10;
-  const warn  = key === "battery" ? 120 : 5;
+  const warn = key === "battery" ? 120 : 5;
   const color = ageSec > stale ? "#ef4444" : ageSec > warn ? "#f59e0b" : "#10b981";
   return { text: `${ageSec.toFixed(1)}s ago`, color };
 };
@@ -51,42 +51,49 @@ export default function TeleopPage() {
   const { ros, isConnected, status: globalStatus, errorText: globalErrorText, reconnect } = useROS();
 
   const [telemetry, setTelemetry] = useState({
-    battery: { enabled: true, topic: "/battery",             messageType: "std_msgs/Float32", valuePath: "data", auxPath: null, scale: 1, unit: "%",   auxUnit: "V",  json: false },
-    temp:    { enabled: true, topic: "/temperature/internal", messageType: "std_msgs/Float32", valuePath: "data", scale: 1, unit: "°C",                               json: false },
-    fan:     { enabled: true, topic: "/fan_rpm",              messageType: "std_msgs/Int32",   valuePath: "data", scale: 1, unit: "rpm",                              json: false },
+    battery: { enabled: true, topic: "/battery", messageType: "std_msgs/Float32", valuePath: "data", auxPath: null, scale: 1, unit: "%", auxUnit: "V", json: false },
+    temp: { enabled: true, topic: "/temperature/internal", messageType: "std_msgs/Float32", valuePath: "data", scale: 1, unit: "°C", json: false },
+    fan: { enabled: true, topic: "/fan_rpm", messageType: "std_msgs/Int32", valuePath: "data", scale: 1, unit: "rpm", json: false },
   });
 
-  const [linearMaxStr,  setLinearMaxStr]  = useState("0.6");
+  const [linearMaxStr, setLinearMaxStr] = useState("0.6");
   const [angularMaxStr, setAngularMaxStr] = useState("1.2");
-  const [scaleStr,      setScaleStr]      = useState({ battery: "1", temp: "1", fan: "1" });
-  const [telErr,        setTelErr]        = useState("");
-  const [telVals,       setTelVals]       = useState({
+  const [scaleStr, setScaleStr] = useState({ battery: "1", temp: "1", fan: "1" });
+  const [telErr, setTelErr] = useState("");
+  const [telVals, setTelVals] = useState({
     battery: { value: null, aux: null, ts: 0 },
-    temp:    { value: null, aux: null, ts: 0 },
-    fan:     { value: null, aux: null, ts: 0 },
+    temp: { value: null, aux: null, ts: 0 },
+    fan: { value: null, aux: null, ts: 0 },
   });
 
   const telSubsRef = useRef({ battery: null, temp: null, fan: null });
 
   // ── DÜZELTİLDİ: /cmd_vel_joystick (priority 95) ve /emergency/active ──
-  const [topicName,        setTopicName]        = useState("/cmd_vel_joystick");
-  const [linearMax,        setLinearMax]        = useState(0.6);
-  const [angularMax,       setAngularMax]       = useState(1.2);
-  const [emergencyTopic,   setEmergencyTopic]   = useState("/emergency/active");
+  const [topicName, setTopicName] = useState("/cmd_vel_joystick");
+  const [linearMax, setLinearMax] = useState(0.6);
+  const [angularMax, setAngularMax] = useState(1.2);
+  const [emergencyTopic, setEmergencyTopic] = useState("/emergency/active");
   const [emergencyMsgType, setEmergencyMsgType] = useState("std_msgs/Bool");
-  const [estop,            setEstop]            = useState(false);
-  const [showSettings,     setShowSettings]     = useState(false);
-  const [controlMode,      setControlMode]      = useState("joystick");
-  const [tick,             setTick]             = useState(0);
+  const [estop, setEstop] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [controlMode, setControlMode] = useState("joystick");
+  const [tick, setTick] = useState(0);
 
-  const cmdVelRef       = useRef(null);
-  const emergencyRef    = useRef(null);
+  // Adaptive velocity mode (1=hassas, 2=normal, 3=hızlı, 4=max)
+  const [speedMode, setSpeedMode] = useState(() => {
+    const v = parseInt(localStorage.getItem("adaptive_velocity_mode") || "2", 10);
+    return [1, 2, 3, 4].includes(v) ? v : 2;
+  });
+  const [speedBusy, setSpeedBusy] = useState(false);
+
+  const cmdVelRef = useRef(null);
+  const emergencyRef = useRef(null);
   const emergencySubRef = useRef(null);   // ← YENİ: STM'den gelen e-stop'u dinlemek için
   const joystickZoneRef = useRef(null);
-  const joystickRef     = useRef(null);
-  const axesRef         = useRef({ x: 0, y: 0 });
-  const timerRef        = useRef(null);
-  const lastSentRef     = useRef({ lin: 0, ang: 0, zeroCount: 0 });
+  const joystickRef = useRef(null);
+  const axesRef = useRef({ x: 0, y: 0 });
+  const timerRef = useRef(null);
+  const lastSentRef = useRef({ lin: 0, ang: 0, zeroCount: 0 });
   const twist0 = useMemo(() => ({ linear: { x: 0, y: 0, z: 0 }, angular: { x: 0, y: 0, z: 0 } }), []);
 
   useEffect(() => {
@@ -98,6 +105,39 @@ export default function TeleopPage() {
     cmdVelRef.current?.publish({ ...twist0, linear: { x: linX, y: 0, z: 0 }, angular: { x: 0, y: 0, z: angZ } });
   };
   const publishEmergency = v => { emergencyRef.current?.publish({ data: v }); };
+
+  const publishSpeedMode = (mode) => {
+    if (!ros || !isConnected) return;
+    try {
+      setSpeedBusy(true);
+      const t = new ROSLIB.Topic({
+        ros,
+        name: "/adaptive_velocity",
+        messageType: "std_msgs/Int32",
+        queue_length: 1,
+      });
+      t.advertise();
+
+      // ✅ advertise'ın rosbridge'e ulaşması için kısa bekleme
+      setTimeout(() => {
+        try {
+          t.publish({ data: mode });
+        } catch (e) {
+          console.warn("[Teleop] publish error:", e);
+        }
+        setTimeout(() => {
+          try { t.unadvertise(); } catch { }
+          setSpeedBusy(false);
+        }, 300);
+      }, 80); // 80ms bekle — rosbridge handshake için yeterli
+
+      setSpeedMode(mode);
+      try { localStorage.setItem("adaptive_velocity_mode", String(mode)); } catch { } // ✅ setItem
+    } catch (e) {
+      console.warn("[Teleop] adaptive_velocity publish error:", e);
+      setSpeedBusy(false);
+    }
+  };
   const safeStop = () => {
     axesRef.current = { x: 0, y: 0 };
     publishTwist(0, 0);
@@ -107,7 +147,7 @@ export default function TeleopPage() {
 
   useEffect(() => {
     if (!ros || !isConnected) { cmdVelRef.current = null; emergencyRef.current = null; return; }
-    cmdVelRef.current    = new ROSLIB.Topic({ ros, name: topicName,      messageType: "geometry_msgs/Twist", queue_length: 1 });
+    cmdVelRef.current = new ROSLIB.Topic({ ros, name: topicName, messageType: "geometry_msgs/Twist", queue_length: 1 });
     emergencyRef.current = new ROSLIB.Topic({ ros, name: emergencyTopic, messageType: emergencyMsgType });
     return () => { cmdVelRef.current = null; emergencyRef.current = null; };
   }, [ros, isConnected, topicName, emergencyTopic, emergencyMsgType]);
@@ -115,7 +155,7 @@ export default function TeleopPage() {
   // ── YENİ: STM'den /emergency/active topic'ine gelen mesajı dinle ──
   useEffect(() => {
     if (!ros || !isConnected) {
-      try { emergencySubRef.current?.unsubscribe(); } catch {}
+      try { emergencySubRef.current?.unsubscribe(); } catch { }
       emergencySubRef.current = null;
       return;
     }
@@ -136,7 +176,7 @@ export default function TeleopPage() {
     });
     emergencySubRef.current = sub;
     return () => {
-      try { sub.unsubscribe(); } catch {}
+      try { sub.unsubscribe(); } catch { }
       emergencySubRef.current = null;
     };
   }, [ros, isConnected, emergencyTopic, emergencyMsgType]);
@@ -148,10 +188,10 @@ export default function TeleopPage() {
       joystickRef.current?.destroy(); joystickRef.current = null;
       const rect = zone.getBoundingClientRect();
       const size = Math.min(Math.max(1, rect.width), Math.max(1, rect.height)) * 0.65;
-      const mgr  = nipplejs.create({ zone, mode: "static", position: { left: "50%", top: "50%" }, color: ACCENT, size, restOpacity: 0.7, dynamicPage: true });
+      const mgr = nipplejs.create({ zone, mode: "static", position: { left: "50%", top: "50%" }, color: ACCENT, size, restOpacity: 0.7, dynamicPage: true });
       joystickRef.current = mgr;
       mgr.on("move", (_, d) => { axesRef.current = { x: -clamp(d.vector.x, -1, 1), y: clamp(d.vector.y, -1, 1) }; });
-      mgr.on("end",  ()     => { axesRef.current = { x: 0, y: 0 }; publishTwist(0, 0); });
+      mgr.on("end", () => { axesRef.current = { x: 0, y: 0 }; publishTwist(0, 0); });
     };
     const raf = requestAnimationFrame(create);
     const onResize = () => requestAnimationFrame(create);
@@ -171,7 +211,7 @@ export default function TeleopPage() {
   };
   const cleanupTel = () => {
     const s = telSubsRef.current;
-    ["battery", "temp", "fan"].forEach(k => { try { s[k]?.unsubscribe(); } catch {} s[k] = null; });
+    ["battery", "temp", "fan"].forEach(k => { try { s[k]?.unsubscribe(); } catch { } s[k] = null; });
   };
 
   useEffect(() => {
@@ -184,16 +224,18 @@ export default function TeleopPage() {
       try {
         const t = new ROSLIB.Topic({ ros, name: cfg.topic, messageType: cfg.messageType });
         t.subscribe(msg => {
-          const m   = parseMaybeJson(msg, cfg);
-          const rv  = getByPath(m, cfg.valuePath);
-          const ra  = cfg.auxPath ? getByPath(m, cfg.auxPath) : undefined;
+          const m = parseMaybeJson(msg, cfg);
+          const rv = getByPath(m, cfg.valuePath);
+          const ra = cfg.auxPath ? getByPath(m, cfg.auxPath) : undefined;
           const val = typeof rv === "number" ? rv : rv != null ? Number(rv) : null;
           const aux = typeof ra === "number" ? ra : ra != null ? Number(ra) : null;
-          setTelVals(p => ({ ...p, [key]: {
-            value: val == null || !isFinite(val) ? null : val * (cfg.scale ?? 1),
-            aux:   aux == null || !isFinite(aux) ? null : aux,
-            ts: Date.now(),
-          }}));
+          setTelVals(p => ({
+            ...p, [key]: {
+              value: val == null || !isFinite(val) ? null : val * (cfg.scale ?? 1),
+              aux: aux == null || !isFinite(aux) ? null : aux,
+              ts: Date.now(),
+            }
+          }));
         });
         subs[key] = t;
       } catch (e) { setTelErr(p => p || `${key}: ${e?.message || e}`); }
@@ -218,7 +260,7 @@ export default function TeleopPage() {
       const cx = Math.abs(x) < DZ ? 0 : x, cy = Math.abs(y) < DZ ? 0 : y;
       const lin = clamp(cy * linearMax, -linearMax, linearMax);
       const ang = clamp(cx * angularMax, -angularMax, angularMax);
-      const isZ  = lin === 0 && ang === 0;
+      const isZ = lin === 0 && ang === 0;
       const last = lastSentRef.current;
       if (isZ) { if (last.zeroCount < 3) { publishTwist(0, 0); last.zeroCount++; } last.lin = 0; last.ang = 0; return; }
       last.zeroCount = 0; last.lin = lin; last.ang = ang;
@@ -228,21 +270,21 @@ export default function TeleopPage() {
   }, [isConnected, estop, linearMax, angularMax]);
 
   const telCards = [
-    { k: "battery", label: "BATTERY",  fmt: v => v == null ? "—" : `${v.toFixed(0)}`, barColor: v => v == null ? TEXT3 : v > 50 ? "#10b981" : v > 20 ? "#f59e0b" : "#ef4444" },
-    { k: "temp",    label: "TEMP",     fmt: v => v == null ? "—" : `${v.toFixed(1)}`, barColor: v => v == null ? TEXT3 : v < 60 ? "#10b981" : v < 80 ? "#f59e0b" : "#ef4444" },
-    { k: "fan",     label: "FAN RPM",  fmt: v => v == null ? "—" : `${v.toFixed(0)}`, barColor: () => ACCENT },
+    { k: "battery", label: "BATTERY", fmt: v => v == null ? "—" : `${v.toFixed(0)}`, barColor: v => v == null ? TEXT3 : v > 50 ? "#10b981" : v > 20 ? "#f59e0b" : "#ef4444" },
+    { k: "temp", label: "TEMP", fmt: v => v == null ? "—" : `${v.toFixed(1)}`, barColor: v => v == null ? TEXT3 : v < 60 ? "#10b981" : v < 80 ? "#f59e0b" : "#ef4444" },
+    { k: "fan", label: "FAN RPM", fmt: v => v == null ? "—" : `${v.toFixed(0)}`, barColor: () => ACCENT },
   ];
 
   const dirBtns = [
-    { label: "↖", x: -0.7, y:  1, diag: true },
-    { label: "↑", x:  0,   y:  1 },
-    { label: "↗", x:  0.7, y:  1, diag: true },
-    { label: "←", x: -1,   y:  0 },
+    { label: "↖", x: -0.7, y: 1, diag: true },
+    { label: "↑", x: 0, y: 1 },
+    { label: "↗", x: 0.7, y: 1, diag: true },
+    { label: "←", x: -1, y: 0 },
     { stop: true },
-    { label: "→", x:  1,   y:  0 },
+    { label: "→", x: 1, y: 0 },
     { label: "↙", x: -0.7, y: -1, diag: true },
-    { label: "↓", x:  0,   y: -1 },
-    { label: "↘", x:  0.7, y: -1, diag: true },
+    { label: "↓", x: 0, y: -1 },
+    { label: "↘", x: 0.7, y: -1, diag: true },
   ];
 
   return (
@@ -339,6 +381,51 @@ export default function TeleopPage() {
           })}
         </div>
 
+        {/* ── SPEED MODE (adaptive_velocity) ── */}
+        <div style={{
+          flexShrink: 0, background: SURFACE, borderRadius: 5,
+          border: `1px solid ${BORDER2}`,
+          padding: "0.5rem 0.75rem",
+          display: "flex", alignItems: "center", gap: "0.6rem", flexWrap: "wrap",
+        }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: "0.15rem" }}>
+            <div style={lblStyle}>HIZ MODU</div>
+            <div style={{ fontSize: "0.55rem", color: TEXT3 }}>/adaptive_velocity · std_msgs/Int32</div>
+          </div>
+          <div style={{ display: "flex", gap: "0.35rem", marginLeft: "auto", flexWrap: "wrap" }}>
+            {[
+              { id: 1, label: "1 · HASSAS", color: "#10b981" },
+              { id: 2, label: "2 · NORMAL", color: "#0ea5e9" },
+              { id: 3, label: "3 · HIZLI", color: "#f59e0b" },
+              { id: 4, label: "4 · MAX", color: "#ef4444" },
+            ].map(({ id, label, color }) => {
+              const active = speedMode === id;
+              const disabled = !isConnected || speedBusy;
+              return (
+                <button
+                  key={id}
+                  onClick={() => publishSpeedMode(id)}
+                  disabled={disabled}
+                  title={!isConnected ? "ROS bağlı değil" : `Modu ${id} olarak yayınla`}
+                  style={{
+                    ...btnStyle(
+                      active ? color : TEXT2,
+                      active ? `${color}22` : "transparent",
+                      `1px solid ${active ? color : BORDER2}`
+                    ),
+                    minWidth: 98,
+                    opacity: disabled ? 0.55 : 1,
+                    cursor: disabled ? "not-allowed" : "pointer",
+                    boxShadow: active ? `0 0 10px ${color}33` : "none",
+                  }}
+                >
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
         {/* ── SETTINGS ── */}
         {showSettings && (
           <div style={{ flexShrink: 0, background: SURFACE, borderRadius: 6, padding: "0.85rem", border: `1px solid ${BORDER2}`, maxHeight: "52vh", overflowY: "auto" }}>
@@ -346,8 +433,8 @@ export default function TeleopPage() {
 
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(155px,1fr))", gap: "0.55rem", marginBottom: "0.75rem" }}>
               {[
-                { label: "CMD_VEL TOPIC",      value: topicName,        set: setTopicName        },
-                { label: "EMERGENCY TOPIC",    value: emergencyTopic,   set: setEmergencyTopic   },
+                { label: "CMD_VEL TOPIC", value: topicName, set: setTopicName },
+                { label: "EMERGENCY TOPIC", value: emergencyTopic, set: setEmergencyTopic },
                 { label: "EMERGENCY MSG TYPE", value: emergencyMsgType, set: setEmergencyMsgType },
               ].map(({ label, value, set }) => (
                 <div key={label}>
@@ -388,9 +475,9 @@ export default function TeleopPage() {
                     </div>
                     <div style={{ display: "grid", gridTemplateColumns: "2fr 2fr 1fr 1fr", gap: "0.35rem" }}>
                       {[
-                        { lbl: "TOPIC",      val: cfg.topic,       set: v => setTelemetry(p => ({ ...p, [k]: { ...p[k], topic: v } })) },
-                        { lbl: "MSG TYPE",   val: cfg.messageType, set: v => setTelemetry(p => ({ ...p, [k]: { ...p[k], messageType: v } })) },
-                        { lbl: "VALUE PATH", val: cfg.valuePath,   set: v => setTelemetry(p => ({ ...p, [k]: { ...p[k], valuePath: v } })) },
+                        { lbl: "TOPIC", val: cfg.topic, set: v => setTelemetry(p => ({ ...p, [k]: { ...p[k], topic: v } })) },
+                        { lbl: "MSG TYPE", val: cfg.messageType, set: v => setTelemetry(p => ({ ...p, [k]: { ...p[k], messageType: v } })) },
+                        { lbl: "VALUE PATH", val: cfg.valuePath, set: v => setTelemetry(p => ({ ...p, [k]: { ...p[k], valuePath: v } })) },
                       ].map(({ lbl, val, set }) => (
                         <div key={lbl}>
                           <div style={lblStyle}>{lbl}</div>
@@ -413,7 +500,7 @@ export default function TeleopPage() {
                       <div style={{ marginTop: "0.4rem", display: "grid", gridTemplateColumns: "2fr 1fr 1fr", gap: "0.35rem" }}>
                         {[
                           { lbl: "AUX PATH", val: cfg.auxPath || "", set: v => setTelemetry(p => ({ ...p, battery: { ...p.battery, auxPath: v } })) },
-                          { lbl: "UNIT",     val: cfg.unit    || "", set: v => setTelemetry(p => ({ ...p, battery: { ...p.battery, unit:    v } })) },
+                          { lbl: "UNIT", val: cfg.unit || "", set: v => setTelemetry(p => ({ ...p, battery: { ...p.battery, unit: v } })) },
                           { lbl: "AUX UNIT", val: cfg.auxUnit || "", set: v => setTelemetry(p => ({ ...p, battery: { ...p.battery, auxUnit: v } })) },
                         ].map(({ lbl, val, set }) => (
                           <div key={lbl}>
@@ -492,7 +579,7 @@ export default function TeleopPage() {
                     pointerEvents: "none", zIndex: 10,
                   }}>
                     <div style={{ fontSize: "0.7rem", color: "#ef4444", fontWeight: 800, letterSpacing: "0.12em", textAlign: "center" }}>
-                      ⬡<br/>ACİL DURDURMA<br/>AKTİF
+                      ⬡<br />ACİL DURDURMA<br />AKTİF
                     </div>
                   </div>
                 )}
@@ -530,7 +617,7 @@ export default function TeleopPage() {
                   ) : (
                     <button key={i}
                       onPointerDown={() => { axesRef.current = { x: b.x, y: b.y }; }}
-                      onPointerUp={()   => { axesRef.current = { x: 0, y: 0 }; publishTwist(0, 0); }}
+                      onPointerUp={() => { axesRef.current = { x: 0, y: 0 }; publishTwist(0, 0); }}
                       onPointerLeave={() => { axesRef.current = { x: 0, y: 0 }; publishTwist(0, 0); }}
                       disabled={estop}
                       style={{
@@ -581,10 +668,10 @@ export default function TeleopPage() {
                   boxShadow: "0 0 14px rgba(239,68,68,0.18)", transition: "all 0.15s",
                 }}
                 onMouseEnter={e => { e.currentTarget.style.background = "rgba(239,68,68,0.22)"; e.currentTarget.style.boxShadow = "0 0 28px rgba(239,68,68,0.4)"; }}
-                onMouseLeave={e => { e.currentTarget.style.background = "rgba(239,68,68,0.1)";  e.currentTarget.style.boxShadow = "0 0 14px rgba(239,68,68,0.18)"; }}
+                onMouseLeave={e => { e.currentTarget.style.background = "rgba(239,68,68,0.1)"; e.currentTarget.style.boxShadow = "0 0 14px rgba(239,68,68,0.18)"; }}
               >
                 <div style={{ width: 38, height: 38, borderRadius: "50%", border: "2px solid #ef4444", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "1.2rem", boxShadow: "0 0 10px #ef4444" }}>⬡</div>
-                ACİL<br/>DURDUR
+                ACİL<br />DURDUR
               </button>
 
               <button
@@ -604,7 +691,7 @@ export default function TeleopPage() {
                 onMouseLeave={e => { if (estop) { e.currentTarget.style.background = "rgba(16,185,129,0.1)"; e.currentTarget.style.boxShadow = "0 0 14px rgba(16,185,129,0.2)"; } }}
               >
                 <div style={{ width: 38, height: 38, borderRadius: "50%", border: `2px solid ${estop ? "#10b981" : BORDER2}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: "1.2rem", boxShadow: estop ? "0 0 10px #10b981" : "none" }}>◉</div>
-                E-STOP<br/>ÇÖZ
+                E-STOP<br />ÇÖZ
               </button>
             </div>
 
@@ -618,7 +705,7 @@ export default function TeleopPage() {
 
             <div style={{ marginTop: "0.6rem", display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.4rem" }}>
               {[
-                { label: "LINEAR MAX",  value: `${linearMax.toFixed(2)} m/s`  },
+                { label: "LINEAR MAX", value: `${linearMax.toFixed(2)} m/s` },
                 { label: "ANGULAR MAX", value: `${angularMax.toFixed(2)} r/s` },
               ].map(({ label, value }) => (
                 <div key={label} style={{ background: SRF2, border: `1px solid ${BORDER}`, borderRadius: 4, padding: "0.38rem 0.5rem" }}>

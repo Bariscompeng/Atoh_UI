@@ -21,6 +21,7 @@ export default function TopNav() {
       <Link to="/coverage" style={active("/coverage")}>Coverage</Link>
       <Link to="/piezo" style={active("/piezo")}>Piezo</Link>
       <Link to="/tasks" style={active("/tasks")}>Task Manager</Link>
+      <Link to="/nav2-params" style={active("/nav2-params")}>Nav2 Params</Link>
       <Link to="/terminal" style={active("/terminal")}>Terminal</Link>
 
 
