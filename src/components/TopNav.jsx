@@ -17,6 +17,7 @@ export default function TopNav() {
       <Link to="/" style={active("/")}>Teleop</Link>
       <Link to="/map" style={active("/map")}>Live Map</Link>
       <Link to="/human-snapshots" style={active("/human-snapshots")}>Human</Link>
+      
       <Link to="/health" style={active("/health")}>Health</Link>
       <Link to="/coverage" style={active("/coverage")}>Coverage</Link>
       <Link to="/piezo" style={active("/piezo")}>Piezo</Link>

@@ -48,7 +48,14 @@ const ageLabel = (ts, key) => {
 };
 
 export default function TeleopPage() {
-  const { ros, isConnected, status: globalStatus, errorText: globalErrorText, reconnect } = useROS();
+  const {
+    ros, isConnected, status: globalStatus, errorText: globalErrorText, reconnect,
+    // ── Cihazlar arası senkron + sayfa değişiminde kaybolmaz ──
+    estop, setEstop,
+    speedMode, setSpeedMode,
+    linearMax, setLinearMax,
+    angularMax, setAngularMax,
+  } = useROS();
 
   const [telemetry, setTelemetry] = useState({
     battery: { enabled: true, topic: "/battery", messageType: "std_msgs/Float32", valuePath: "data", auxPath: null, scale: 1, unit: "%", auxUnit: "V", json: false },
@@ -56,8 +63,13 @@ export default function TeleopPage() {
     fan: { enabled: true, topic: "/fan_rpm", messageType: "std_msgs/Int32", valuePath: "data", scale: 1, unit: "rpm", json: false },
   });
 
-  const [linearMaxStr, setLinearMaxStr] = useState("0.6");
-  const [angularMaxStr, setAngularMaxStr] = useState("1.2");
+  // Input buffer state'leri context değerinden başlatılır
+  const [linearMaxStr, setLinearMaxStr] = useState(() => String(linearMax));
+  const [angularMaxStr, setAngularMaxStr] = useState(() => String(angularMax));
+  // Context değeri başka cihazdan veya localStorage'dan değişirse input'u güncelle
+  useEffect(() => { setLinearMaxStr(String(linearMax)); }, [linearMax]);
+  useEffect(() => { setAngularMaxStr(String(angularMax)); }, [angularMax]);
+
   const [scaleStr, setScaleStr] = useState({ battery: "1", temp: "1", fan: "1" });
   const [telErr, setTelErr] = useState("");
   const [telVals, setTelVals] = useState({
@@ -68,27 +80,19 @@ export default function TeleopPage() {
 
   const telSubsRef = useRef({ battery: null, temp: null, fan: null });
 
-  // ── DÜZELTİLDİ: /cmd_vel_joystick (priority 95) ve /emergency/active ──
+  // Cihaza özgü config (publish hedefleri) — bunları senkronlamıyoruz
   const [topicName, setTopicName] = useState("/cmd_vel_joystick");
-  const [linearMax, setLinearMax] = useState(0.6);
-  const [angularMax, setAngularMax] = useState(1.2);
   const [emergencyTopic, setEmergencyTopic] = useState("/emergency/active");
   const [emergencyMsgType, setEmergencyMsgType] = useState("std_msgs/Bool");
-  const [estop, setEstop] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [controlMode, setControlMode] = useState("joystick");
   const [tick, setTick] = useState(0);
 
-  // Adaptive velocity mode (1=hassas, 2=normal, 3=hızlı, 4=max)
-  const [speedMode, setSpeedMode] = useState(() => {
-    const v = parseInt(localStorage.getItem("adaptive_velocity_mode") || "2", 10);
-    return [1, 2, 3, 4].includes(v) ? v : 2;
-  });
+  // estop / speedMode / linearMax / angularMax → ROSContext (cihazlar arası senkron)
   const [speedBusy, setSpeedBusy] = useState(false);
 
   const cmdVelRef = useRef(null);
-  const emergencyRef = useRef(null);
-  const emergencySubRef = useRef(null);   // ← YENİ: STM'den gelen e-stop'u dinlemek için
+  // emergencyRef / emergencySubRef artık ROSContext'te yönetiliyor
   const joystickZoneRef = useRef(null);
   const joystickRef = useRef(null);
   const axesRef = useRef({ x: 0, y: 0 });
@@ -104,40 +108,16 @@ export default function TeleopPage() {
   const publishTwist = (linX, angZ) => {
     cmdVelRef.current?.publish({ ...twist0, linear: { x: linX, y: 0, z: 0 }, angular: { x: 0, y: 0, z: angZ } });
   };
-  const publishEmergency = v => { emergencyRef.current?.publish({ data: v }); };
 
+  // Speed mode → context setSpeedMode çağırıyor. Context hem state'i günceller
+  // hem /adaptive_velocity topic'ine latched publish eder → tüm cihazlar senkron.
   const publishSpeedMode = (mode) => {
-    if (!ros || !isConnected) return;
-    try {
-      setSpeedBusy(true);
-      const t = new ROSLIB.Topic({
-        ros,
-        name: "/adaptive_velocity",
-        messageType: "std_msgs/Int32",
-        queue_length: 1,
-      });
-      t.advertise();
-
-      // ✅ advertise'ın rosbridge'e ulaşması için kısa bekleme
-      setTimeout(() => {
-        try {
-          t.publish({ data: mode });
-        } catch (e) {
-          console.warn("[Teleop] publish error:", e);
-        }
-        setTimeout(() => {
-          try { t.unadvertise(); } catch { }
-          setSpeedBusy(false);
-        }, 300);
-      }, 80); // 80ms bekle — rosbridge handshake için yeterli
-
-      setSpeedMode(mode);
-      try { localStorage.setItem("adaptive_velocity_mode", String(mode)); } catch { } // ✅ setItem
-    } catch (e) {
-      console.warn("[Teleop] adaptive_velocity publish error:", e);
-      setSpeedBusy(false);
-    }
+    if (!isConnected) return;
+    setSpeedBusy(true);
+    setSpeedMode(mode);
+    setTimeout(() => setSpeedBusy(false), 300);
   };
+
   const safeStop = () => {
     axesRef.current = { x: 0, y: 0 };
     publishTwist(0, 0);
@@ -145,41 +125,26 @@ export default function TeleopPage() {
     setTimeout(() => publishTwist(0, 0), 160);
   };
 
+  // cmd_vel publisher — topic adı değiştiğinde yeniden kur
   useEffect(() => {
-    if (!ros || !isConnected) { cmdVelRef.current = null; emergencyRef.current = null; return; }
+    if (!ros || !isConnected) { cmdVelRef.current = null; return; }
     cmdVelRef.current = new ROSLIB.Topic({ ros, name: topicName, messageType: "geometry_msgs/Twist", queue_length: 1 });
-    emergencyRef.current = new ROSLIB.Topic({ ros, name: emergencyTopic, messageType: emergencyMsgType });
-    return () => { cmdVelRef.current = null; emergencyRef.current = null; };
-  }, [ros, isConnected, topicName, emergencyTopic, emergencyMsgType]);
+    return () => { cmdVelRef.current = null; };
+  }, [ros, isConnected, topicName]);
 
-  // ── YENİ: STM'den /emergency/active topic'ine gelen mesajı dinle ──
+  // ── estop dışarıdan (başka cihaz, STM veya context sub) aktifleşirse:
+  //    güvenlik için hemen üç kez sıfır bas ──
+  const estopPrevRef = useRef(false);
   useEffect(() => {
-    if (!ros || !isConnected) {
-      try { emergencySubRef.current?.unsubscribe(); } catch { }
-      emergencySubRef.current = null;
-      return;
+    if (estop && !estopPrevRef.current) {
+      publishTwist(0, 0);
+      setTimeout(() => publishTwist(0, 0), 80);
+      setTimeout(() => publishTwist(0, 0), 160);
     }
-    const sub = new ROSLIB.Topic({ ros, name: emergencyTopic, messageType: emergencyMsgType });
-    sub.subscribe(msg => {
-      // std_msgs/Bool → msg.data (boolean)
-      // std_msgs/Int32 / UInt8 vb. → msg.data (number)
-      const active = msg.data === true || msg.data === 1 || msg.data === "1";
-      setEstop(prev => {
-        if (active && !prev) {
-          // Dışarıdan e-stop geldi → hemen sıfır bas (güvenlik)
-          publishTwist(0, 0);
-          setTimeout(() => publishTwist(0, 0), 80);
-          setTimeout(() => publishTwist(0, 0), 160);
-        }
-        return active;
-      });
-    });
-    emergencySubRef.current = sub;
-    return () => {
-      try { sub.unsubscribe(); } catch { }
-      emergencySubRef.current = null;
-    };
-  }, [ros, isConnected, emergencyTopic, emergencyMsgType]);
+    estopPrevRef.current = estop;
+    // publishTwist bir closure — cmdVelRef güncel olduğu sürece sorun yok
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [estop]);
 
   useEffect(() => {
     const zone = joystickZoneRef.current;
@@ -244,7 +209,7 @@ export default function TeleopPage() {
     return cleanupTel;
   }, [isConnected, ros, telemetry]);
 
-  // ── DÜZELTİLDİ: estop aktifken sürekli sıfır bas, nav2'yi bastır ──
+  // ── estop aktifken sürekli sıfır bas, nav2'yi bastır ──
   useEffect(() => {
     if (timerRef.current) clearInterval(timerRef.current);
     timerRef.current = setInterval(() => {
@@ -306,7 +271,7 @@ export default function TeleopPage() {
               border: `1px solid rgba(14,165,233,0.35)`, borderRadius: 6,
               display: "flex", alignItems: "center", justifyContent: "center",
               fontSize: "1rem", boxShadow: "0 0 12px rgba(14,165,233,0.15)",
-            }}>🤖</div>
+            }}>◆</div>
             <div>
               <div style={{ fontSize: "0.82rem", fontWeight: 800, letterSpacing: "0.14em", color: ACCENT }}>SIMSOFT ATOH</div>
               <div style={{ fontSize: "0.55rem", color: TEXT2, letterSpacing: "0.1em", marginTop: 1 }}>TELEOP CONTROL · cmd_vel_joystick</div>
@@ -338,8 +303,8 @@ export default function TeleopPage() {
             </span>
           )}
           {!isConnected
-            ? <button onClick={reconnect} style={btnStyle(ACCENT, "rgba(14,165,233,0.12)", `1px solid ${ACCENT}`)}>⚡ Bağlan</button>
-            : <span style={{ fontSize: "0.62rem", color: "#10b981", fontWeight: 600 }}>● CONNECTED</span>
+            ? <button onClick={reconnect} style={btnStyle(ACCENT, "rgba(14,165,233,0.12)", `1px solid ${ACCENT}`)}>↻ Bağlan</button>
+            : <span style={{ fontSize: "0.62rem", color: "#10b981", fontWeight: 600 }}>✓ CONNECTED</span>
           }
         </div>
 
@@ -652,9 +617,8 @@ export default function TeleopPage() {
             <div style={{ flex: 1, display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.5rem" }}>
               <button
                 onClick={() => {
-                  setEstop(true);
-                  publishEmergency(true);
-                  // Üç kez sıfır bas (güvenlik)
+                  setEstop(true);                            // context publish eder + tüm cihazlar senkron
+                  // Güvenlik: hemen üç kez sıfır bas
                   publishTwist(0, 0);
                   setTimeout(() => publishTwist(0, 0), 80);
                   setTimeout(() => publishTwist(0, 0), 160);
@@ -675,7 +639,7 @@ export default function TeleopPage() {
               </button>
 
               <button
-                onClick={() => { setEstop(false); publishEmergency(false); }}
+                onClick={() => setEstop(false)}
                 style={{
                   background: estop ? "rgba(16,185,129,0.1)" : "transparent",
                   border: `2px solid ${estop ? "#10b981" : BORDER2}`,

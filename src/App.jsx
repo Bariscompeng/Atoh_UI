@@ -11,6 +11,7 @@ import PiezoPage from "./pages/PiezoPage";
 import TerminalPage from "./pages/TerminalPage";
 import TaskManagerPage from "./pages/TaskManagerPage";
 import Nav2ParamsPage from "./pages/Nav2ParamsPage";
+
 export default function App() {
   return (
     <BrowserRouter>
@@ -20,13 +21,14 @@ export default function App() {
           <Routes>
             <Route path="/" element={<TeleopPage />} />
             <Route path="/map" element={<MapPage />} />
+           
             <Route path="/human-snapshots" element={<HumanSnapshots />} />
             <Route path="/health" element={<HealthPage />} />
             <Route path="/coverage" element={<CoveragePage />} />
             <Route path="/piezo" element={<PiezoPage />} />
             <Route path="/terminal" element={<TerminalPage />} />
             <Route path="/tasks" element={<TaskManagerPage />} />
-            <Route path="/nav2-params" element={<Nav2ParamsPage />} />
+            
           </Routes>
         </div>
       </ROSProvider>

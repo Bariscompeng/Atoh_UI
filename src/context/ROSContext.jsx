@@ -21,6 +21,26 @@ function saveUrl(url) {
   try { localStorage.setItem("rosbridge_url_v1", url); } catch {}
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// SENKRONİZE EDİLEN TOPIC'LER
+// ──────────────────────────────────────────────────────────────────────────
+// Birden fazla tarayıcı/cihaz aynı rosbridge'e bağlandığında, bu topic'ler
+// üzerinden state senkronize olur. Her değişiklik latched publish edilir,
+// her client aynı topic'e subscribe olur → kendi publish'i + başka client'ların
+// publish'i hep aynı flow'dan state'e yansır. Böylece tüm cihazlar aynı anda
+// güncellenir.
+//
+// /ui/* topic'leri sadece UI client'ları arasındaki senkronizasyon içindir.
+// Robot tarafı bunları umursamaz.
+// ══════════════════════════════════════════════════════════════════════════
+const SYNC_TOPICS = {
+  humanFollow: { name: "/human_follow/enable", type: "std_msgs/Bool"    },
+  emergency:   { name: "/emergency/active",    type: "std_msgs/Bool"    },
+  speedMode:   { name: "/adaptive_velocity",   type: "std_msgs/Int32"   },
+  linearMax:   { name: "/ui/linear_max",       type: "std_msgs/Float32" },
+  angularMax:  { name: "/ui/angular_max",      type: "std_msgs/Float32" },
+};
+
 export function ROSProvider({ children }) {
   const [rosbridgeUrl, setRosbridgeUrl] = useState(loadUrl);
   const [status, setStatus] = useState("Bağlanmadı");
@@ -35,95 +55,193 @@ export function ROSProvider({ children }) {
   const connectingRef = useRef(false);
 
   // ══════════════════════════════════════════════════════════════════════════
-  // OPERASYON MODU — tüm sayfalar bunu paylaşır
+  // PAYLAŞILAN STATE — Provider App seviyesinde mount'ludur, sayfa değişse bile
+  // ölmez. Tüm cihazlar bu state'leri ROS topic'leri üzerinden senkronize eder.
   // ══════════════════════════════════════════════════════════════════════════
   const [operationMode, setOperationModeState] = useState("manual");
-  const modSubRef = useRef(null);
+  const [humanFollowEnabled, setHumanFollowEnabledState] = useState(false);
+  const [estop, setEstopState] = useState(false);
+  const [speedMode, setSpeedModeState] = useState(() => {
+    const v = parseInt(localStorage.getItem("adaptive_velocity_mode") || "2", 10);
+    return [1, 2, 3, 4].includes(v) ? v : 2;
+  });
+  const [linearMax, setLinearMaxState] = useState(() => {
+    const v = parseFloat(localStorage.getItem("ui_linear_max") || "0.6");
+    return isFinite(v) && v > 0 ? v : 0.6;
+  });
+  const [angularMax, setAngularMaxState] = useState(() => {
+    const v = parseFloat(localStorage.getItem("ui_angular_max") || "1.2");
+    return isFinite(v) && v > 0 ? v : 1.2;
+  });
+
+  // Publisher / Subscriber referansları
+  const pubsRef = useRef({}); // { key: ROSLIB.Topic }
+  const subsRef = useRef({}); // { key: ROSLIB.Topic }
+
+  // ── Bir topic için latched publisher döner (yoksa advertise eder) ──────────
+  const ensurePublisher = useCallback((key) => {
+    const ros = rosRef.current;
+    if (!ros) return null;
+    if (pubsRef.current[key]) return pubsRef.current[key];
+    const cfg = SYNC_TOPICS[key];
+    const topic = new ROSLIB.Topic({
+      ros,
+      name: cfg.name,
+      messageType: cfg.type,
+      latch: true,   // rosbridge latched → geç bağlanan client son değeri alır
+      queue_size: 1,
+    });
+    try { topic.advertise(); } catch {}
+    pubsRef.current[key] = topic;
+    return topic;
+  }, []);
+
+  // ── Sync publish helper ────────────────────────────────────────────────────
+  const publishSync = useCallback((key, value) => {
+    const p = ensurePublisher(key);
+    if (!p) return;
+    try { p.publish({ data: value }); }
+    catch (e) { console.warn(`[ROSContext] publish ${key} error:`, e); }
+  }, [ensurePublisher]);
 
   // ══════════════════════════════════════════════════════════════════════════
-  // HUMAN FOLLOW — tüm sayfalar bunu paylaşır
+  // SUBSCRIBE — Bağlantı kurulunca veya yenilenince tüm sync topic'lere abone ol
   // ══════════════════════════════════════════════════════════════════════════
-  const [humanFollowEnabled, setHumanFollowEnabled] = useState(false);
-
-  // /mod subscribe — dışarıdan gelen mod değişikliklerini yakala
   useEffect(() => {
     const ros = rosRef.current;
     if (!ros || !isConnected) return;
 
-    if (modSubRef.current) {
-      try { modSubRef.current.unsubscribe(); } catch {}
-    }
+    // Eski sub'ları ve pub'ları temizle (yeni ros instance için yeniden kur)
+    Object.values(subsRef.current).forEach(s => { try { s.unsubscribe(); } catch {} });
+    subsRef.current = {};
+    Object.values(pubsRef.current).forEach(p => { try { p.unadvertise(); } catch {} });
+    pubsRef.current = {};
 
-    const topic = new ROSLIB.Topic({
-      ros,
-      name: "/mod",
-      messageType: "std_msgs/msg/String",
-      throttle_rate: 200,
-      queue_length: 1,
-    });
-
-    topic.subscribe((msg) => {
-      const val = (msg.data || "").toLowerCase().trim();
-      if (["manual", "autonomous", "task"].includes(val)) {
-        setOperationModeState(val);
-      }
-    });
-
-    modSubRef.current = topic;
-    return () => { try { topic.unsubscribe(); } catch {} };
-  }, [rosInstance, isConnected]);
-
-  // Mod değiştir + /mod publish + geçiş aksiyonları
-  const setOperationMode = useCallback((newMode) => {
-    const ros = rosRef.current;
-    if (!ros || !isConnected) {
-      setOperationModeState(newMode);
-      return;
-    }
-
-    const prevMode = operationMode;
-    setOperationModeState(newMode);
-
-    // 1) /mod publish
+    // ── /mod subscribe (operationMode) ──────────────────────────────────────
     try {
-      const modTopic = new ROSLIB.Topic({
+      const modSub = new ROSLIB.Topic({
         ros, name: "/mod",
         messageType: "std_msgs/msg/String",
-        queue_size: 1,
+        throttle_rate: 200, queue_length: 1,
       });
-      modTopic.publish({ data: newMode });
-      setTimeout(() => { try { modTopic.unadvertise(); } catch {} }, 500);
-    } catch {}
+      modSub.subscribe((msg) => {
+        const val = (msg.data || "").toLowerCase().trim();
+        if (["manual", "autonomous", "task"].includes(val)) {
+          setOperationModeState(val);
+        }
+      });
+      subsRef.current.mod = modSub;
+    } catch (e) { console.warn("[ROSContext] /mod sub error:", e); }
 
-    // 2) Otonom/Task → Manuel geçişi: Nav2 goal iptal et
-    if (newMode === "manual" && (prevMode === "autonomous" || prevMode === "task")) {
-      cancelNav2Goal(ros);
-    }
+    // ── humanFollow subscribe ───────────────────────────────────────────────
+    try {
+      const hfSub = new ROSLIB.Topic({
+        ros, name: SYNC_TOPICS.humanFollow.name,
+        messageType: SYNC_TOPICS.humanFollow.type,
+        queue_length: 1,
+      });
+      hfSub.subscribe((msg) => {
+        setHumanFollowEnabledState(!!msg.data);
+      });
+      subsRef.current.humanFollow = hfSub;
+    } catch (e) { console.warn("[ROSContext] humanFollow sub error:", e); }
 
-    console.log(`[ROSContext] Mode: ${prevMode} → ${newMode}`);
-  }, [rosInstance, isConnected, operationMode]);
+    // ── estop subscribe ─────────────────────────────────────────────────────
+    try {
+      const esSub = new ROSLIB.Topic({
+        ros, name: SYNC_TOPICS.emergency.name,
+        messageType: SYNC_TOPICS.emergency.type,
+        queue_length: 1,
+      });
+      esSub.subscribe((msg) => {
+        const active = msg.data === true || msg.data === 1 || msg.data === "1";
+        setEstopState(active);
+      });
+      subsRef.current.estop = esSub;
+    } catch (e) { console.warn("[ROSContext] estop sub error:", e); }
 
-  // Nav2 goal iptal — navigate_to_pose action cancel
+    // ── speedMode subscribe ─────────────────────────────────────────────────
+    try {
+      const smSub = new ROSLIB.Topic({
+        ros, name: SYNC_TOPICS.speedMode.name,
+        messageType: SYNC_TOPICS.speedMode.type,
+        queue_length: 1,
+      });
+      smSub.subscribe((msg) => {
+        const v = parseInt(msg.data, 10);
+        if ([1, 2, 3, 4].includes(v)) {
+          setSpeedModeState(v);
+          try { localStorage.setItem("adaptive_velocity_mode", String(v)); } catch {}
+        }
+      });
+      subsRef.current.speedMode = smSub;
+    } catch (e) { console.warn("[ROSContext] speedMode sub error:", e); }
+
+    // ── linearMax / angularMax subscribe (UI-only senkron) ──────────────────
+    try {
+      const lmSub = new ROSLIB.Topic({
+        ros, name: SYNC_TOPICS.linearMax.name,
+        messageType: SYNC_TOPICS.linearMax.type,
+        queue_length: 1,
+      });
+      lmSub.subscribe((msg) => {
+        const v = Number(msg.data);
+        if (isFinite(v) && v > 0) {
+          setLinearMaxState(v);
+          try { localStorage.setItem("ui_linear_max", String(v)); } catch {}
+        }
+      });
+      subsRef.current.linearMax = lmSub;
+    } catch (e) { console.warn("[ROSContext] linearMax sub error:", e); }
+
+    try {
+      const amSub = new ROSLIB.Topic({
+        ros, name: SYNC_TOPICS.angularMax.name,
+        messageType: SYNC_TOPICS.angularMax.type,
+        queue_length: 1,
+      });
+      amSub.subscribe((msg) => {
+        const v = Number(msg.data);
+        if (isFinite(v) && v > 0) {
+          setAngularMaxState(v);
+          try { localStorage.setItem("ui_angular_max", String(v)); } catch {}
+        }
+      });
+      subsRef.current.angularMax = amSub;
+    } catch (e) { console.warn("[ROSContext] angularMax sub error:", e); }
+
+    return () => {
+      Object.values(subsRef.current).forEach(s => { try { s.unsubscribe(); } catch {} });
+      subsRef.current = {};
+      // pubsRef'leri burada kapatmıyoruz — aktif bir publish için tekrar advertise
+      // gerekebilir. Provider unmount'unda toplu temizlenir.
+    };
+  }, [rosInstance, isConnected]);
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // PUBLIC SETTER'LAR
+  // ──────────────────────────────────────────────────────────────────────────
+  // Her setter optimistic update yapar (UI hemen tepki versin), sonra publish
+  // eder. Subscriber callback'i aynı değerle ikinci kez setState çağırsa bile
+  // React aynı değer için re-render yapmaz — zararsız.
+  // ══════════════════════════════════════════════════════════════════════════
+
+  // Nav2 goal iptal (mod manuele döndüğünde)
   const cancelNav2Goal = useCallback((ros) => {
     if (!ros) return;
     try {
       const cancelTopic = new ROSLIB.Topic({
-        ros,
-        name: "/navigate_to_pose/_action/cancel",
+        ros, name: "/navigate_to_pose/_action/cancel",
         messageType: "action_msgs/msg/GoalID",
         queue_size: 1,
       });
       cancelTopic.publish({});
       setTimeout(() => { try { cancelTopic.unadvertise(); } catch {} }, 500);
-      console.log("[ROSContext] Nav2 goal cancel sent");
-    } catch (e) {
-      console.warn("[ROSContext] Nav2 cancel error:", e);
-    }
+    } catch (e) { console.warn("[ROSContext] Nav2 cancel error:", e); }
 
     try {
       const cmdTopic = new ROSLIB.Topic({
-        ros,
-        name: "/cmd_vel",
+        ros, name: "/cmd_vel",
         messageType: "geometry_msgs/msg/Twist",
         queue_size: 1,
       });
@@ -135,36 +253,73 @@ export function ROSProvider({ children }) {
     } catch {}
   }, []);
 
-  // Human Follow toggle — /human_follow/enable (std_msgs/Bool) publish eder
-  // Yeni state'i döner (HumanSnapshots bunu kullanır)
-  const toggleHumanFollow = useCallback(() => {
+  const setOperationMode = useCallback((newMode) => {
     const ros = rosRef.current;
-    const next = !humanFollowEnabled;
-    setHumanFollowEnabled(next);
+    const prevMode = operationMode;
+    setOperationModeState(newMode);
 
     if (ros && isConnected) {
       try {
-        const topic = new ROSLIB.Topic({
-          ros,
-          name: "/human_follow/enable",
-          messageType: "std_msgs/Bool",
+        const modTopic = new ROSLIB.Topic({
+          ros, name: "/mod",
+          messageType: "std_msgs/msg/String",
           queue_size: 1,
+          latch: true,
         });
-        topic.publish({ data: next });
-        setTimeout(() => { try { topic.unadvertise(); } catch {} }, 500);
-        console.log(`[ROSContext] human_follow/enable → ${next}`);
-      } catch (e) {
-        console.warn("[ROSContext] toggleHumanFollow error:", e);
+        modTopic.advertise();
+        modTopic.publish({ data: newMode });
+        // Not: burayı unadvertise etmiyoruz ki latched değer kaybolmasın
+        setTimeout(() => { try { modTopic.unadvertise(); } catch {} }, 800);
+      } catch {}
+
+      if (newMode === "manual" && (prevMode === "autonomous" || prevMode === "task")) {
+        cancelNav2Goal(ros);
       }
     }
+    console.log(`[ROSContext] Mode: ${prevMode} → ${newMode}`);
+  }, [isConnected, operationMode, cancelNav2Goal]);
 
+  const toggleHumanFollow = useCallback(() => {
+    const next = !humanFollowEnabled;
+    setHumanFollowEnabledState(next);
+    if (isConnected) publishSync("humanFollow", next);
+    console.log(`[ROSContext] human_follow/enable → ${next}`);
     return next;
-  }, [humanFollowEnabled, isConnected]);
+  }, [humanFollowEnabled, isConnected, publishSync]);
+
+  const setEstop = useCallback((active) => {
+    const v = !!active;
+    setEstopState(v);
+    if (isConnected) publishSync("emergency", v);
+  }, [isConnected, publishSync]);
+
+  const setSpeedMode = useCallback((mode) => {
+    const m = parseInt(mode, 10);
+    if (![1, 2, 3, 4].includes(m)) return;
+    setSpeedModeState(m);
+    try { localStorage.setItem("adaptive_velocity_mode", String(m)); } catch {}
+    if (isConnected) publishSync("speedMode", m);
+  }, [isConnected, publishSync]);
+
+  const setLinearMax = useCallback((v) => {
+    const num = Number(v);
+    if (!isFinite(num) || num <= 0) return;
+    setLinearMaxState(num);
+    try { localStorage.setItem("ui_linear_max", String(num)); } catch {}
+    if (isConnected) publishSync("linearMax", num);
+  }, [isConnected, publishSync]);
+
+  const setAngularMax = useCallback((v) => {
+    const num = Number(v);
+    if (!isFinite(num) || num <= 0) return;
+    setAngularMaxState(num);
+    try { localStorage.setItem("ui_angular_max", String(num)); } catch {}
+    if (isConnected) publishSync("angularMax", num);
+  }, [isConnected, publishSync]);
 
   // ══════════════════════════════════════════════════════════════════════════
   // BAĞLANTI YÖNETİMİ
   // ══════════════════════════════════════════════════════════════════════════
-
   useEffect(() => { saveUrl(rosbridgeUrl); }, [rosbridgeUrl]);
 
   const connect = useCallback((url) => {
@@ -236,6 +391,13 @@ export function ROSProvider({ children }) {
     return () => {
       console.log("[ROSContext] Provider unmount");
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+
+      // Tüm publisher/subscriber'ları temizle
+      Object.values(pubsRef.current).forEach(p => { try { p.unadvertise(); } catch {} });
+      pubsRef.current = {};
+      Object.values(subsRef.current).forEach(s => { try { s.unsubscribe(); } catch {} });
+      subsRef.current = {};
+
       if (rosRef.current) {
         try { rosRef.current.removeAllListeners(); rosRef.current.close(); } catch {}
       }
@@ -263,12 +425,25 @@ export function ROSProvider({ children }) {
     rosbridgeUrl,
     setRosbridgeUrl,
     reconnect,
-    // Mod sistemi
+
+    // ── Cihazlar ve sayfalar arasında senkronize paylaşılan state ──
     operationMode,
     setOperationMode,
-    // Human Follow sistemi
+
     humanFollowEnabled,
     toggleHumanFollow,
+
+    estop,
+    setEstop,
+
+    speedMode,
+    setSpeedMode,
+
+    linearMax,
+    setLinearMax,
+
+    angularMax,
+    setAngularMax,
   };
 
   return <ROSContext.Provider value={value}>{children}</ROSContext.Provider>;

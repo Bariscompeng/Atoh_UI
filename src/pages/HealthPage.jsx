@@ -70,7 +70,7 @@ const DEFAULT_HZ_TOPICS = [
   { topic: "/odom",         messageType: "nav_msgs/Odometry",              label: "ODOM" },
   { topic: "/imu/data",     messageType: "sensor_msgs/Imu",               label: "IMU" },
   { topic: "/scan",         messageType: "sensor_msgs/LaserScan",          label: "LIDAR" },
-  { topic: "/camera/image", messageType: "sensor_msgs/CompressedImage",    label: "CAMERA" },
+  { topic: "/usb_cam/image_raw", messageType: "sensor_msgs/CompressedImage",    label: "CAMERA" },
   { topic: "/cmd_vel_serial", messageType: "geometry_msgs/Twist",          label: "CMD_VEL" },
 ];
 
