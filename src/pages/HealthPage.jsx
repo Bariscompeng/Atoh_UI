@@ -66,12 +66,14 @@ const cardStyle = (bg = SRF2, border = BORDER2) => ({
 });
 
 // ── Default monitored topics ────────────────────────────────────────────────
+// /usb_cam/image_raw default KAPALI — CompressedImage 30fps × 100KB → rosbridge
+// JSON serialization'ı CPU yer. Kullanıcı isterse manuel açabilir.
 const DEFAULT_HZ_TOPICS = [
-  { topic: "/odom",         messageType: "nav_msgs/Odometry",              label: "ODOM" },
-  { topic: "/imu/data",     messageType: "sensor_msgs/Imu",               label: "IMU" },
-  { topic: "/scan",         messageType: "sensor_msgs/LaserScan",          label: "LIDAR" },
-  { topic: "/usb_cam/image_raw", messageType: "sensor_msgs/CompressedImage",    label: "CAMERA" },
-  { topic: "/cmd_vel_serial", messageType: "geometry_msgs/Twist",          label: "CMD_VEL" },
+  { topic: "/odom",         messageType: "nav_msgs/Odometry",              label: "ODOM",   enabled: true  },
+  { topic: "/imu/data",     messageType: "sensor_msgs/Imu",                label: "IMU",    enabled: true  },
+  { topic: "/scan",         messageType: "sensor_msgs/LaserScan",          label: "LIDAR",  enabled: true  },
+  { topic: "/usb_cam/image_raw", messageType: "sensor_msgs/CompressedImage", label: "CAMERA", enabled: false },
+  { topic: "/cmd_vel_serial", messageType: "geometry_msgs/Twist",          label: "CMD_VEL", enabled: true },
 ];
 
 // ── Topic Hz Monitor ────────────────────────────────────────────────────────
@@ -79,7 +81,7 @@ const WINDOW_SEC = 3;           // sliding window for Hz calc
 const TICK_MS    = 500;         // UI refresh interval
 
 const TopicHzMonitor = ({ ros, connected }) => {
-  const [topics, setTopics]       = useState(() => DEFAULT_HZ_TOPICS.map(t => ({ ...t, enabled: true })));
+  const [topics, setTopics]       = useState(() => DEFAULT_HZ_TOPICS.map(t => ({ ...t, enabled: t.enabled !== false })));
   const [hzData, setHzData]       = useState({});   // { topic: { hz, count, lastTs, jitter } }
   const [showAdd, setShowAdd]     = useState(false);
   const [newTopic, setNewTopic]   = useState("");
@@ -117,7 +119,18 @@ const TopicHzMonitor = ({ ros, connected }) => {
       if (subsRef.current[cfg.topic]) return;   // already subscribed
       if (!stampBufRef.current[cfg.topic]) stampBufRef.current[cfg.topic] = [];
       try {
-        const t = new ROSLIB.Topic({ ros, name: cfg.topic, messageType: cfg.messageType });
+        // CompressedImage / Image / PointCloud2 / LaserScan: byte-array ağırlıklı
+        // mesajlar için cbor-raw kullan (rosbridge JSON serialization'ı atlar).
+        // Diğer mesajlar küçük ve sık olduğu için JSON varsayılan yeterli — cbor
+        // moduna güvenmiyoruz çünkü roslibjs/rosbridge kombinasyonu bazı mesaj
+        // tiplerinde subscribe callback'ini çağırmıyor (Odometry, Imu, Twist).
+        const isBinaryHeavy = /Image|PointCloud2|LaserScan/.test(cfg.messageType);
+        const opts = {
+          ros, name: cfg.topic, messageType: cfg.messageType,
+          queue_length: 1,
+        };
+        if (isBinaryHeavy) opts.compression = "cbor-raw";
+        const t = new ROSLIB.Topic(opts);
         t.subscribe(() => {
           const buf = stampBufRef.current[cfg.topic];
           if (buf) buf.push(Date.now());
@@ -358,8 +371,10 @@ const TFTreeVisualizer = ({ ros, connected }) => {
         all[t.child_frame_id] = { child: t.child_frame_id, parent: t.header.frame_id };
       });
     };
-    const tf       = new ROSLIB.Topic({ ros, name: "/tf",        messageType: "tf2_msgs/TFMessage" });
-    const tfStatic = new ROSLIB.Topic({ ros, name: "/tf_static", messageType: "tf2_msgs/TFMessage" });
+    // 1.5 saniye dinleyip frame'leri topluyoruz — throttle koymak gerekli, aksi
+    // halde /tf saniyede ~100 kez yayınlandığı için 150 mesaj serileştirilir.
+    const tf       = new ROSLIB.Topic({ ros, name: "/tf",        messageType: "tf2_msgs/TFMessage", throttle_rate: 200, queue_length: 1 });
+    const tfStatic = new ROSLIB.Topic({ ros, name: "/tf_static", messageType: "tf2_msgs/TFMessage", queue_length: 1 });
     tf.subscribe(process); tfStatic.subscribe(process);
 
     setTimeout(() => {
@@ -499,7 +514,12 @@ export default function HealthPage() {
 
   useEffect(() => {
     if (!ros || !isConnected) return;
-    const topic = new ROSLIB.Topic({ ros, name: "/system/diagnostics", messageType: "diagnostic_msgs/msg/DiagnosticArray", queue_length: 1 });
+    const topic = new ROSLIB.Topic({
+      ros, name: "/system/diagnostics",
+      messageType: "diagnostic_msgs/msg/DiagnosticArray",
+      queue_length: 1,
+      throttle_rate: 1000,   // 1Hz UI için fazlasıyla yeter
+    });
     topic.subscribe(msg => { setDiag(msg); if (msg?.header?.stamp) setLastStamp(msg.header.stamp); });
     return () => { try { topic.unsubscribe(); } catch {} };
   }, [ros, isConnected]);

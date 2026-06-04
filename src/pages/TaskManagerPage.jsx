@@ -145,7 +145,7 @@ export default function TaskManagerPage() {
       setRobotPose({ x, y, yaw }); setPoseSource("TF");
     };
 
-    const tf = new ROSLIB.Topic({ ros, name: "/tf", messageType: "tf2_msgs/msg/TFMessage", throttle_rate: 100, queue_length: 5 });
+    const tf = new ROSLIB.Topic({ ros, name: "/tf", messageType: "tf2_msgs/msg/TFMessage", throttle_rate: 500, queue_length: 1, compression: "cbor" });
     tf.subscribe((msg) => {
       if (!msg.transforms) return;
       for (const t of msg.transforms) {
@@ -160,11 +160,11 @@ export default function TaskManagerPage() {
     });
     tfSubRef.current = tf;
 
-    const amcl = new ROSLIB.Topic({ ros, name: "/amcl_pose", messageType: "geometry_msgs/msg/PoseWithCovarianceStamped", throttle_rate: 200, queue_length: 1 });
+    const amcl = new ROSLIB.Topic({ ros, name: "/amcl_pose", messageType: "geometry_msgs/msg/PoseWithCovarianceStamped", throttle_rate: 200, queue_length: 1, compression: "cbor" });
     amcl.subscribe((msg) => { lastAmclTime = Date.now(); const p = msg.pose.pose; setRobotPose({ x: p.position.x, y: p.position.y, yaw: quatToYaw(p.orientation) }); setPoseSource("AMCL"); });
     amclSubRef.current = amcl;
 
-    const odom = new ROSLIB.Topic({ ros, name: "/odom", messageType: "nav_msgs/msg/Odometry", throttle_rate: 200, queue_length: 1 });
+    const odom = new ROSLIB.Topic({ ros, name: "/odom", messageType: "nav_msgs/msg/Odometry", throttle_rate: 200, queue_length: 1, compression: "cbor" });
     odom.subscribe((msg) => { if (Date.now() - lastAmclTime < 2000 || Date.now() - lastTfTime < 2000) return; const p = msg.pose.pose; setRobotPose({ x: p.position.x, y: p.position.y, yaw: quatToYaw(p.orientation) }); setPoseSource("ODOM"); });
     odomSubRef.current = odom;
     return () => { [amcl, tf, odom].forEach(t => { try { t.unsubscribe(); } catch {} }); };

@@ -24,6 +24,7 @@ export default function TopNav() {
       <Link to="/tasks" style={active("/tasks")}>Task Manager</Link>
       <Link to="/nav2-params" style={active("/nav2-params")}>Nav2 Params</Link>
       <Link to="/terminal" style={active("/terminal")}>Terminal</Link>
+      <Link to="/gps-mission" style={active("/gps-mission")}>GPS Mission</Link>
 
 
 

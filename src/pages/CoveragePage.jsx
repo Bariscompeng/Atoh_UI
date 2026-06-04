@@ -1,5 +1,17 @@
 // ═════════════════════════════════════════════════════════════════════════════
-//  CoveragePage.jsx  —  useMapLoader gömülü (QoS fix)
+//  CoveragePage.jsx  —  Polygon coverage + MANUEL PATH çizim modu
+//
+//  v3 değişiklikleri (bu sürümde eklenenler):
+//    • MANUEL PATH MODU: haritaya nokta nokta tıkla → düz çizgilerle bağlanır
+//      → "Path Gönder" → robot çizgileri takip eder.
+//      ROS akışı: UI tıkları → /coverage/manual_points (PoseArray)
+//                 → [manual_path_node] → /coverage/path
+//                 → [coverage_executor_node] (follow_path) → Nav2
+//    • Manuel modda point_spacing=0.30 (node tarafında) → robot HIZLI gider
+//      (yoğun 0.10 noktalama yok → RPP düz çizgiyi düz görür → tam hız).
+//
+//  Mevcut özellikler korundu: useMapLoader (QoS fix + RViz renk + rotasyon),
+//  polygon coverage, 2D Nav Goal, Hassas İşlem, Offset Takibi, optimizasyon.
 // ═════════════════════════════════════════════════════════════════════════════
 
 import React, {
@@ -9,26 +21,51 @@ import { useROS } from "../context/ROSContext";
 import * as ROSLIB from "roslib";
 
 // ─── useMapLoader (gömülü — ayrı dosya gerekmez) ─────────────────────────────
-// SORUN: map_server transient_local QoS yayınlar, rosbridge volatile subscribe
-// eder → hotspot/geç bağlanmada harita gelmiyor.
-// ÇÖZÜM: Önce /map_server/map servisi dene (nav2 built-in, QoS sorunu yok),
-//         başarısız olursa /map topic'e fallback yap.
 const clampV = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
 function parseOccupancyGrid(msg) {
   if (!msg?.info?.width || !msg?.info?.height) return null;
+
+  const q = msg.info.origin.orientation;
+  const originYaw = q ? Math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z)) : 0;
+
   const info = {
     resolution: msg.info.resolution,
     width:      msg.info.width,
     height:     msg.info.height,
     originX:    msg.info.origin.position.x,
     originY:    msg.info.origin.position.y,
+    originYaw:  originYaw,
   };
   const img = new ImageData(info.width, info.height);
-  for (let i = 0; i < info.width * info.height; i++) {
-    const v = msg.data[i];
-    const c = v < 0 ? 128 : 255 - clampV(Math.round((v / 100) * 255), 0, 255);
-    img.data[i * 4] = c; img.data[i * 4 + 1] = c; img.data[i * 4 + 2] = c; img.data[i * 4 + 3] = 255;
+
+  const FREE_THRESH = 25;
+  const OCC_THRESH  = 65;
+
+  for (let y = 0; y < info.height; y++) {
+    for (let x = 0; x < info.width; x++) {
+      const rosIdx = y * info.width + x;
+      const canvasY = info.height - 1 - y;
+      const canvasIdx = canvasY * info.width + x;
+
+      const v = msg.data[rosIdx];
+      let c;
+      if (v < 0) {
+        c = 205;
+      } else if (v >= OCC_THRESH) {
+        c = 0;
+      } else if (v <= FREE_THRESH) {
+        c = 254;
+      } else {
+        const t = (v - FREE_THRESH) / (OCC_THRESH - FREE_THRESH);
+        c = Math.round(254 - t * 254);
+      }
+
+      img.data[canvasIdx * 4]     = c;
+      img.data[canvasIdx * 4 + 1] = c;
+      img.data[canvasIdx * 4 + 2] = c;
+      img.data[canvasIdx * 4 + 3] = 255;
+    }
   }
   return { info, imageData: img };
 }
@@ -81,10 +118,9 @@ function useMapLoader(ros, isConnected, mapTopicName = "/map") {
       applyMap(msg, `topic: ${mapTopicName}`);
     });
     subRef.current = topic;
-    // 8 sn içinde mesaj gelmezse servisi tekrar dene
     watchdogRef.current = setTimeout(() => {
       if (!hasMapRef.current && mountedRef.current) {
-        setMapError("Topic'ten mesaj gelmedi — servis tekrar deneniyor");
+        setMapError("Topic'ten mesaj gelmedi → servis tekrar deneniyor");
         tryService(); // eslint-disable-line no-use-before-define
       }
     }, 8000);
@@ -108,7 +144,7 @@ function useMapLoader(ros, isConnected, mapTopicName = "/map") {
         if (!mountedRef.current) return;
         const msg = res?.map ?? res;
         if (applyMap(msg, "/map_server/map (servis)")) {
-          subscribeToTopic(); // arka planda topic'i de dinle (güncellemeler için)
+          subscribeToTopic();
         } else {
           setMapError("Servis boş döndü → topic deneniyor");
           subscribeToTopic();
@@ -151,7 +187,7 @@ function useMapLoader(ros, isConnected, mapTopicName = "/map") {
 }
 // ─── /useMapLoader ────────────────────────────────────────────────────────────
 
-// ─── Diğer Helpers ────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 function prettyErr(e) {
   if (!e) return "";
@@ -166,7 +202,7 @@ function yawToQuaternion(yaw) {
   return { x: 0, y: 0, z: Math.sin(yaw / 2), w: Math.cos(yaw / 2) };
 }
 
-// ─── Geometry ─────────────────────────────────────────────────────────────────
+// ─── Geometry (polygon preview için) ─────────────────────────────────────────
 function lineIntersection(x1, y1, x2, y2, x3, y3, x4, y4) {
   const d = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
   if (Math.abs(d) < 1e-10) return null;
@@ -237,19 +273,20 @@ function previewToPoses(path) {
   });
 }
 
-const MODE_IDLE = "idle", MODE_SELECT = "select", MODE_GOALPOSE = "goalpose", MODE_PRECISION = "precision";
+// MODE_MANUAL eklendi
+const MODE_IDLE = "idle", MODE_SELECT = "select", MODE_GOALPOSE = "goalpose",
+      MODE_PRECISION = "precision", MODE_MANUAL = "manual";
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
 export default function CoveragePage() {
   const { ros, isConnected, status: gSt, errorText: gErr, reconnect } = useROS();
   const [pageStatus, setPageStatus] = useState("");
   const [pageError,  setPageError]  = useState("");
 
-  // ── Map — useMapLoader (QoS fix, ayrı dosya gerekmez) ────────────────────
+  // Map
   const [mapTopicName, setMapTopicName] = useState("/map");
   const { mapInfo, mapImageData, mapLoading, mapError: mapLoaderError, mapSource, reloadMap } =
     useMapLoader(ros, isConnected, mapTopicName);
-  // Not: mapTRef ve /map useEffect silindi — hook yönetiyor.
 
   // Robot
   const [robotPose,  setRobotPose]  = useState(null);
@@ -258,7 +295,8 @@ export default function CoveragePage() {
   useEffect(() => { robotPoseRef.current = robotPose; }, [robotPose]);
 
   // Interaction
-  const [points,     setPoints]     = useState([]);
+  const [points,     setPoints]     = useState([]);   // polygon (4 nokta)
+  const [manualPoints, setManualPoints] = useState([]); // YENİ: manuel path noktaları
   const [activeMode, setActiveMode] = useState(MODE_IDLE);
   const [goalEnabled,      setGoalEnabled]      = useState(false);
   const [precisionEnabled, setPrecisionEnabled] = useState(false);
@@ -268,11 +306,16 @@ export default function CoveragePage() {
   const [goalDragEnd, setGoalDragEnd] = useState(null);
 
   // Coverage settings
-  const [style,       setStyle]       = useState("zigzag");
+  const [style,        setStyle]        = useState("zigzag");
   const [lineSpacing, setLineSpacing] = useState(0.4);
   const [sweepAngle,  setSweepAngle]  = useState(90);
   const [startCorner, setStartCorner] = useState(0);
-  const [execMode,    setExecMode]    = useState("navigate_through_poses");
+  const [execMode,    setExecMode]    = useState("follow_path");
+
+  const [autoOrient,    setAutoOrient]    = useState(true);
+  const [margin,        setMargin]        = useState(0.10);
+  const [pointDensity,  setPointDensity]  = useState(0.10);
+  const [perimeterPass, setPerimeterPass] = useState(false);
 
   // Path
   const [pathMsg,     setPathMsg]     = useState(null);
@@ -321,7 +364,17 @@ export default function CoveragePage() {
   const canvasToWorld = useCallback((cx, cy) => {
     if (!mapInfo || !canvasRef.current) return { wx: 0, wy: 0 };
     const sc = canvasRef.current.width / mapInfo.width;
-    return { wx: mapInfo.originX + (cx / sc) * mapInfo.resolution, wy: mapInfo.originY + (mapInfo.height - cy / sc) * mapInfo.resolution };
+
+    const px = (cx / sc) * mapInfo.resolution;
+    const py = (mapInfo.height - cy / sc) * mapInfo.resolution;
+
+    const c = Math.cos(mapInfo.originYaw);
+    const s = Math.sin(mapInfo.originYaw);
+
+    return {
+      wx: mapInfo.originX + (px * c - py * s),
+      wy: mapInfo.originY + (px * s + py * c),
+    };
   }, [mapInfo]);
 
   // /coverage/path
@@ -394,14 +447,29 @@ export default function CoveragePage() {
     const off = document.createElement("canvas"); off.width = mapInfo.width; off.height = mapInfo.height;
     off.getContext("2d").putImageData(mapImageData, 0, 0);
     ctx.clearRect(0, 0, dW, dH); ctx.imageSmoothingEnabled = false; ctx.drawImage(off, 0, 0, dW, dH);
-    const w2c = (wx, wy) => ({ cx: ((wx - mapInfo.originX) / mapInfo.resolution) * scale, cy: (mapInfo.height - (wy - mapInfo.originY) / mapInfo.resolution) * scale });
+
+    const w2c = (wx, wy) => {
+      const dx = wx - mapInfo.originX;
+      const dy = wy - mapInfo.originY;
+      const c = Math.cos(mapInfo.originYaw || 0);
+      const s = Math.sin(mapInfo.originYaw || 0);
+      const px = dx * c + dy * s;
+      const py = -dx * s + dy * c;
+      return {
+        cx: (px / mapInfo.resolution) * scale,
+        cy: (mapInfo.height - py / mapInfo.resolution) * scale,
+      };
+    };
+
     const arr = (fx, fy, tx, ty, col, h = 8, lw = 2) => {
       const a = Math.atan2(ty - fy, tx - fx);
       ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = lw;
       ctx.beginPath(); ctx.moveTo(fx, fy); ctx.lineTo(tx, ty); ctx.stroke();
       ctx.beginPath(); ctx.moveTo(tx, ty); ctx.lineTo(tx - h * Math.cos(a - Math.PI / 6), ty - h * Math.sin(a - Math.PI / 6)); ctx.lineTo(tx - h * Math.cos(a + Math.PI / 6), ty - h * Math.sin(a + Math.PI / 6)); ctx.closePath(); ctx.fill();
     };
-    if (showPreview && previewPath.length > 1) {
+
+    // Polygon preview (sadece polygon modunda anlamlı)
+    if (showPreview && previewPath.length > 1 && activeMode !== MODE_MANUAL) {
       ctx.globalAlpha = 0.8;
       for (let i = 0; i < previewPath.length - 1; i++) { const { cx: x1, cy: y1 } = w2c(previewPath[i].x, previewPath[i].y); const { cx: x2, cy: y2 } = w2c(previewPath[i + 1].x, previewPath[i + 1].y); arr(x1, y1, x2, y2, "#3b82f6", 10, 2); }
       const { cx: sx, cy: sy } = w2c(previewPath[0].x, previewPath[0].y);
@@ -410,19 +478,48 @@ export default function CoveragePage() {
       ctx.fillStyle = "#ef4444"; ctx.beginPath(); ctx.arc(ex, ey, 8, 0, Math.PI * 2); ctx.fill(); ctx.fillStyle = "#fff"; ctx.fillText("E", ex, ey);
       ctx.globalAlpha = 1;
     }
+
+    // ROS path (yeşil) — hem polygon hem manuel modda /coverage/path'ten gelir
     if (pathMsg?.poses?.length > 1) {
       ctx.globalAlpha = 0.9; ctx.lineWidth = 2; ctx.strokeStyle = "#10b981"; ctx.setLineDash([6, 3]);
       ctx.beginPath(); pathMsg.poses.forEach((ps, i) => { const { cx, cy } = w2c(ps.pose.position.x, ps.pose.position.y); if (i === 0) ctx.moveTo(cx, cy); else ctx.lineTo(cx, cy); });
       ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1;
       pathMsg.poses.forEach((ps, i) => { const { cx, cy } = w2c(ps.pose.position.x, ps.pose.position.y); ctx.fillStyle = i === 0 ? "#22c55e" : i === pathMsg.poses.length - 1 ? "#ef4444" : "rgba(16,185,129,0.5)"; ctx.beginPath(); ctx.arc(cx, cy, i === 0 || i === pathMsg.poses.length - 1 ? 6 : 3, 0, Math.PI * 2); ctx.fill(); });
     }
-    if (points.length > 0) {
+
+    // Polygon noktaları
+    if (points.length > 0 && activeMode !== MODE_MANUAL) {
       const cvs = points.map(p => w2c(p.x, p.y));
       ctx.lineWidth = 2.5; ctx.strokeStyle = "#f97316"; ctx.setLineDash([]);
       ctx.beginPath(); ctx.moveTo(cvs[0].cx, cvs[0].cy); for (let i = 1; i < cvs.length; i++) ctx.lineTo(cvs[i].cx, cvs[i].cy);
       if (points.length === 4) { ctx.closePath(); ctx.stroke(); ctx.fillStyle = "rgba(249,115,22,0.07)"; ctx.fill(); } else ctx.stroke();
       cvs.forEach(({ cx, cy }, i) => { ctx.fillStyle = i === startCorner ? "#22c55e" : "#f97316"; ctx.beginPath(); ctx.arc(cx, cy, 9, 0, Math.PI * 2); ctx.fill(); ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.stroke(); ctx.fillStyle = "#fff"; ctx.font = "bold 11px monospace"; ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillText(String(i + 1), cx, cy); });
     }
+
+    // YENİ: Manuel path çizimi (turuncu polyline)
+    if (activeMode === MODE_MANUAL && manualPoints.length > 0) {
+      const mcvs = manualPoints.map(p => w2c(p.x, p.y));
+      if (mcvs.length > 1) {
+        ctx.strokeStyle = "#f59e0b"; ctx.lineWidth = 2.5; ctx.setLineDash([]);
+        ctx.beginPath(); ctx.moveTo(mcvs[0].cx, mcvs[0].cy);
+        for (let i = 1; i < mcvs.length; i++) ctx.lineTo(mcvs[i].cx, mcvs[i].cy);
+        ctx.stroke();
+        // yön okları
+        for (let i = 0; i < mcvs.length - 1; i++) {
+          const mx = (mcvs[i].cx + mcvs[i+1].cx) / 2, my = (mcvs[i].cy + mcvs[i+1].cy) / 2;
+          arr(mcvs[i].cx, mcvs[i].cy, mx, my, "#f59e0b", 8, 0);
+        }
+      }
+      mcvs.forEach(({ cx, cy }, i) => {
+        ctx.fillStyle = i === 0 ? "#22c55e" : i === mcvs.length - 1 ? "#ef4444" : "#f59e0b";
+        ctx.beginPath(); ctx.arc(cx, cy, 6, 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5; ctx.stroke();
+        ctx.fillStyle = "#fff"; ctx.font = "bold 9px monospace"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        ctx.fillText(String(i + 1), cx, cy);
+      });
+    }
+
+    // Robot
     if (robotPose) {
       const { cx: rx, cy: ry } = w2c(robotPose.x, robotPose.y);
       const g = ctx.createRadialGradient(rx, ry, 0, rx, ry, 22); g.addColorStop(0, "rgba(250,204,21,0.45)"); g.addColorStop(1, "rgba(250,204,21,0)");
@@ -432,13 +529,15 @@ export default function CoveragePage() {
       arr(rx, ry, ax, ay, "#0b1120", 7, 2.5);
       ctx.fillStyle = "#facc15"; ctx.font = "bold 9px monospace"; ctx.textAlign = "center"; ctx.textBaseline = "top"; ctx.fillText("ROBOT", rx, ry + 14);
     }
+
+    // Goal drag arrow
     if (goalDragRef.current && goalDragEnd) {
       const { canvasX: gx, canvasY: gy } = goalDragRef.current; const { canvasX: ex2, canvasY: ey2 } = goalDragEnd;
       ctx.fillStyle = "rgba(168,85,247,0.25)"; ctx.strokeStyle = "#a855f7"; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.arc(gx, gy, 13, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
       const len = Math.max(25, Math.sqrt((ex2 - gx) ** 2 + (ey2 - gy) ** 2)), ang = Math.atan2(ey2 - gy, ex2 - gx);
       arr(gx, gy, gx + Math.min(len, 60) * Math.cos(ang), gy + Math.min(len, 60) * Math.sin(ang), "#a855f7", 12, 3);
     }
-  }, [mapInfo, mapImageData, points, pathMsg, previewPath, showPreview, startCorner, robotPose, goalDragEnd]);
+  }, [mapInfo, mapImageData, points, manualPoints, pathMsg, previewPath, showPreview, startCorner, robotPose, goalDragEnd, activeMode]);
 
   // Canvas events
   const gcp = (e, c) => { const r = c.getBoundingClientRect(); return { canvasX: (e.clientX - r.left) * (c.width / r.width), canvasY: (e.clientY - r.top) * (c.height / r.height) }; };
@@ -446,6 +545,7 @@ export default function CoveragePage() {
     const c = canvasRef.current; if (!c || !mapInfo) return;
     const { canvasX: cx, canvasY: cy } = gcp(e, c); const { wx, wy } = canvasToWorld(cx, cy);
     if (activeMode === MODE_SELECT) setPoints(prev => prev.length >= 4 ? prev : [...prev, { x: wx, y: wy }]);
+    else if (activeMode === MODE_MANUAL) setManualPoints(prev => [...prev, { x: wx, y: wy }]);  // YENİ
     else if (goalEnabled || precisionEnabled || offsetEnabled) { goalDragRef.current = { worldX: wx, worldY: wy, canvasX: cx, canvasY: cy }; setGoalDragEnd({ canvasX: cx, canvasY: cy }); }
   }, [activeMode, goalEnabled, precisionEnabled, offsetEnabled, mapInfo, canvasToWorld]);
   const onMouseMove = useCallback(e => {
@@ -487,7 +587,7 @@ export default function CoveragePage() {
     t.publish({ data: cmd });
     setTimeout(() => { try { t.unadvertise(); } catch {} }, 500);
     setPwPopup(null); setPwPhase("MOVING");
-    setPageStatus(`🎯 PrecisionWorkAt → (${wx.toFixed(2)},${wy.toFixed(2)}) θ:${(yaw * 180 / Math.PI).toFixed(1)}° | hedefe gidiliyor...`);
+    setPageStatus(`✅ PrecisionWorkAt → (${wx.toFixed(2)},${wy.toFixed(2)}) θ:${(yaw * 180 / Math.PI).toFixed(1)}° | hedefe gidiliyor...`);
   }, [ros, isConnected]);
 
   const sendOperatorCmd = useCallback((cmd) => {
@@ -496,17 +596,9 @@ export default function CoveragePage() {
     t.publish({ data: cmd });
     setTimeout(() => { try { t.unadvertise(); } catch {} }, 500);
     setPwPopup(null);
-    if (cmd === "return_home") { setPwPhase("RESUMING"); setPageStatus("🔄 Başlangıç konumuna dönülüyor..."); }
+    if (cmd === "return_home") { setPwPhase("RESUMING"); setPageStatus("↩ Başlangıç konumuna dönülüyor..."); }
     else { setPwPhase(null); setPageStatus("▶ Devam Et seçildi → robot serbest."); }
   }, [ros, isConnected]);
-
-  const publishPolygon = useCallback(() => {
-    if (!ros || !isConnected || points.length !== 4) return;
-    const t = new ROSLIB.Topic({ ros, name: "/coverage/field_polygon", messageType: "geometry_msgs/msg/PolygonStamped", queue_size: 1 });
-    t.publish({ header: { frame_id: "map", stamp: { sec: Math.floor(Date.now() / 1000), nanosec: 0 } }, polygon: { points: points.map(p => ({ x: p.x, y: p.y, z: 0 })) } });
-    setPageStatus("📤 Polygon gönderildi → planner path hesaplıyor..."); setPageError("");
-    setTimeout(() => { try { t.unadvertise(); } catch {} }, 500);
-  }, [ros, isConnected, points]);
 
   const setRosParam = useCallback((node, name, value) => {
     if (!ros || !isConnected) return Promise.resolve();
@@ -516,8 +608,41 @@ export default function CoveragePage() {
     });
   }, [ros, isConnected]);
 
+  const publishPolygon = useCallback(async () => {
+    if (!ros || !isConnected || points.length !== 4) return;
+    await setRosParam("coverage_executor_node", "execution_mode", execMode).catch(() => {});
+    await setRosParam("coverage_planner_node", "auto_orient", autoOrient).catch(() => {});
+    const t = new ROSLIB.Topic({ ros, name: "/coverage/field_polygon", messageType: "geometry_msgs/msg/PolygonStamped", queue_size: 1 });
+    t.publish({ header: { frame_id: "map", stamp: { sec: Math.floor(Date.now() / 1000), nanosec: 0 } }, polygon: { points: points.map(p => ({ x: p.x, y: p.y, z: 0 })) } });
+    setPageStatus("✅ Polygon gönderildi → planner path hesaplıyor..."); setPageError("");
+    setTimeout(() => { try { t.unadvertise(); } catch {} }, 500);
+  }, [ros, isConnected, points, execMode, autoOrient, setRosParam]);
+
+  // YENİ: Manuel path publish (→ /coverage/manual_points → manual_path_node)
+  const publishManualPath = useCallback(async () => {
+    if (!ros || !isConnected) { setPageError("ROS bağlı değil"); return; }
+    if (manualPoints.length < 2) { setPageError("En az 2 nokta gerekli"); return; }
+    // Manuel path her zaman follow_path ile takip edilir (hızlı + pürüzsüz)
+    await setRosParam("coverage_executor_node", "execution_mode", "follow_path").catch(() => {});
+    const t = new ROSLIB.Topic({ ros, name: "/coverage/manual_points", messageType: "geometry_msgs/msg/PoseArray", queue_size: 1 });
+    t.publish({
+      header: { frame_id: "map", stamp: { sec: Math.floor(Date.now() / 1000), nanosec: 0 } },
+      poses: manualPoints.map(pt => ({ position: { x: pt.x, y: pt.y, z: 0 }, orientation: { x: 0, y: 0, z: 0, w: 1 } })),
+    });
+    setPageStatus(`✅ ${manualPoints.length} nokta gönderildi → path üretiliyor`); setPageError("");
+    setTimeout(() => { try { t.unadvertise(); } catch {} }, 500);
+  }, [ros, isConnected, manualPoints, setRosParam]);
+
+  const undoManualPoint = useCallback(() => setManualPoints(prev => prev.slice(0, -1)), []);
+
   const callTrigger = useCallback(name => new Promise((res, rej) =>
     new ROSLIB.Service({ ros, name, serviceType: "std_srvs/srv/Trigger" }).callService({}, res, rej)), [ros]);
+
+  const clearManualPath = useCallback(async () => {
+    setManualPoints([]);
+    setPathMsg(null);
+    try { await callTrigger("/coverage/clear_manual"); setPageStatus("Manuel path temizlendi"); } catch {}
+  }, [callTrigger]);
 
   const recompute = useCallback(async () => {
     if (!ros || !isConnected) return;
@@ -527,21 +652,32 @@ export default function CoveragePage() {
       setRosParam("coverage_planner_node", "sweep_angle_deg",    sweepAngle),
       setRosParam("coverage_planner_node", "diagonal_angle_deg", sweepAngle),
       setRosParam("coverage_planner_node", "start_corner",       startCorner),
+      setRosParam("coverage_planner_node", "auto_orient",        autoOrient),
+      setRosParam("coverage_planner_node", "margin",             margin),
+      setRosParam("coverage_planner_node", "point_density",      pointDensity),
+      setRosParam("coverage_planner_node", "perimeter_pass",     perimeterPass),
+      setRosParam("coverage_executor_node", "execution_mode",    execMode),
+      setRosParam("coverage_executor_node", "go_to_start_first", true),
     ]);
-    try { const r = await callTrigger("/coverage/recompute"); if (r.success) setPageStatus("✅ Path yeniden hesaplandı"); else setPageError("Recompute: " + r.message); }
-    catch (e) { setPageError("Recompute: " + prettyErr(e)); }
-  }, [ros, isConnected, style, lineSpacing, sweepAngle, startCorner, setRosParam, callTrigger]);
+    try {
+      const r = await callTrigger("/coverage/recompute");
+      if (r.success) setPageStatus("✅ Path yeniden hesaplandı");
+      else setPageError("Recompute: " + r.message);
+    } catch (e) { setPageError("Recompute: " + prettyErr(e)); }
+  }, [ros, isConnected, style, lineSpacing, sweepAngle, startCorner,
+      autoOrient, margin, pointDensity, perimeterPass, execMode,
+      setRosParam, callTrigger]);
 
   const startFallbackSequential = useCallback(async () => {
     const poses = pathMsg?.poses?.length >= 2 ? pathMsg.poses : previewPath.length >= 2 ? previewToPoses(previewPath) : null;
-    if (!poses || poses.length < 2) { setPageError("Path yok — 4 nokta seçin ve Polygon Gönder'e basın"); return; }
+    if (!poses || poses.length < 2) { setPageError("Path yok → önce path gönderin"); return; }
     seqRef.current = { active: true, cancel: false };
     setIsRunning(true); setExecProgress(0); setExecStatus(`EXECUTING 0/${poses.length}`);
     const goalTopic = new ROSLIB.Topic({ ros, name: "/goal_pose", messageType: "geometry_msgs/msg/PoseStamped", queue_size: 1 });
     for (let i = 0; i < poses.length; i++) {
       if (seqRef.current.cancel) break;
       setExecProgress(i / poses.length); setExecStatus(`EXECUTING ${i}/${poses.length}`);
-      setPageStatus(`🏃 WP ${i + 1}/${poses.length} → (${poses[i].pose.position.x.toFixed(2)}, ${poses[i].pose.position.y.toFixed(2)})`);
+      setPageStatus(`→ WP ${i + 1}/${poses.length} → (${poses[i].pose.position.x.toFixed(2)}, ${poses[i].pose.position.y.toFixed(2)})`);
       goalTopic.publish({ header: { frame_id: "map", stamp: { sec: Math.floor(Date.now() / 1000), nanosec: 0 } }, pose: poses[i].pose });
       const result = await new Promise(resolve => {
         const start = Date.now();
@@ -566,15 +702,16 @@ export default function CoveragePage() {
   const startCoverage = useCallback(async () => {
     if (!ros || !isConnected) { setPageError("ROS bağlı değil"); return; }
     setPageError("");
-    await setRosParam("coverage_executor_node", "execution_mode", execMode).catch(() => {});
+    const mode = activeMode === MODE_MANUAL ? "follow_path" : execMode;
+    await setRosParam("coverage_executor_node", "execution_mode", mode).catch(() => {});
     if (executorAvailable) {
       try {
         const r = await callTrigger("/coverage/start");
         if (r.success) { setPageStatus("▶ Coverage başlatıldı (C++ executor)"); setIsRunning(true); }
-        else { setPageError("Start: " + r.message + (r.message.includes("No path") ? " — önce Polygon Gönder'e basın" : "")); }
-      } catch { setPageError("Executor servisi yok — Fallback sequential başlatılıyor"); startFallbackSequential(); }
-    } else { setPageStatus("⚠ C++ executor bulunamadı — JS sequential fallback"); startFallbackSequential(); }
-  }, [ros, isConnected, execMode, executorAvailable, callTrigger, setRosParam, startFallbackSequential]);
+        else { setPageError("Start: " + r.message + (r.message.includes("No path") ? " → önce Path Gönder'e basın" : "")); }
+      } catch { setPageError("Executor servisi yok → Fallback sequential başlatılıyor"); startFallbackSequential(); }
+    } else { setPageStatus("⚠ C++ executor bulunamadı → JS sequential fallback"); startFallbackSequential(); }
+  }, [ros, isConnected, execMode, activeMode, executorAvailable, callTrigger, setRosParam, startFallbackSequential]);
 
   const cancelCoverage = useCallback(async () => {
     seqRef.current.cancel = true; setIsRunning(false); setExecStatus("CANCELED");
@@ -583,9 +720,9 @@ export default function CoveragePage() {
     setPageStatus("⏹ İptal edildi");
   }, [ros, executorAvailable, callTrigger]);
 
-  const clearAll = () => { cancelCoverage(); setPoints([]); setPathMsg(null); setExecStatus("IDLE"); setExecProgress(0); goalDragRef.current = null; setGoalDragEnd(null); setActiveMode(MODE_IDLE); setIsRunning(false); setPageStatus(""); setPageError(""); };
+  const clearAll = () => { cancelCoverage(); setPoints([]); setManualPoints([]); setPathMsg(null); setExecStatus("IDLE"); setExecProgress(0); goalDragRef.current = null; setGoalDragEnd(null); setActiveMode(MODE_IDLE); setIsRunning(false); setPageStatus(""); setPageError(""); };
 
-  // Offset Tracking — /task_manager/run_cmd + state subscriber
+  // Offset Tracking → /task_manager/run_cmd + state subscriber
   useEffect(() => {
     if (!ros || !isConnected) { try { otSubRef.current?.unsubscribe(); } catch {} otSubRef.current = null; otCmdRef.current = null; return; }
     otCmdRef.current = new ROSLIB.Topic({ ros, name: "/task_manager/run_cmd", messageType: "std_msgs/msg/String", queue_size: 1 });
@@ -599,11 +736,11 @@ export default function CoveragePage() {
         else if (task.name === "PrecisionWorkAt") {
           const phase = (task.state || "").toUpperCase(); setPwPhase(phase);
           if (phase === "WORKING") { setPwPopup(prev => prev || { open: true }); setPageStatus("🎯 Hedefe ulaşıldı → operatör kararı bekleniyor"); }
-          else if (phase === "MOVING") setPageStatus("🚀 PrecisionWorkAt → hedefe gidiliyor...");
-          else if (phase === "RESUMING") { setPwPopup(null); setPageStatus("🔄 Başlangıç konumuna dönülüyor..."); }
+          else if (phase === "MOVING") setPageStatus("→ PrecisionWorkAt → hedefe gidiliyor...");
+          else if (phase === "RESUMING") { setPwPopup(null); setPageStatus("↩ Başlangıç konumuna dönülüyor..."); }
           else if (["SUCCEEDED", "FAILED", "STOPPED"].includes(phase)) { setPwPopup(null); setPwPhase(null); if (phase === "SUCCEEDED") setPageStatus("✅ PrecisionWorkAt tamamlandı."); }
           setOtStatus(prev => prev === "RUNNING" ? "IDLE" : prev);
-        } else { setOtStatus(prev => prev === "RUNNING" ? "IDLE" : prev); setPwPhase(prev => { if (prev !== null) { setPwPopup(null); if (prev === "RESUMING") setPageStatus("✅ Başlangıç konumuna döndü."); } return null; }); }
+        } else { setOtStatus(prev => prev === "RUNNING" ? "IDLE" : prev); setPwPhase(prev => { if (prev !== null) { setPwPopup(null); if (prev === "RESUMING") setPageStatus("↩ Başlangıç konumuna döndü."); } return null; }); }
       } catch {}
     });
     otSubRef.current = sub;
@@ -619,31 +756,31 @@ export default function CoveragePage() {
   const [wpDone, wpTotal] = useMemo(() => { const m = execStatus.match(/(\d+)\/(\d+)/); if (m) return [parseInt(m[1]), parseInt(m[2])]; if (execStatus === "COMPLETED") return [1, 1]; return [0, 0]; }, [execStatus]);
   const progressPct  = wpTotal > 0 ? wpDone / wpTotal : execProgress;
   const statusColor  = execStatus.startsWith("EXECUTING") ? "#3b82f6" : execStatus === "COMPLETED" ? "#10b981" : execStatus === "CANCELED" ? "#f97316" : execStatus.startsWith("ERROR") ? "#ef4444" : "#475569";
-  const canvasCursor = activeMode === MODE_SELECT ? "crosshair" : (goalEnabled || precisionEnabled || offsetEnabled) ? "cell" : "default";
+  const canvasCursor = (activeMode === MODE_SELECT || activeMode === MODE_MANUAL) ? "crosshair" : (goalEnabled || precisionEnabled || offsetEnabled) ? "cell" : "default";
   const displayStatus = pageStatus || gSt;
-  const displayError  = pageError || mapLoaderError || gErr;   // ← mapLoaderError eklendi
+  const displayError  = pageError || mapLoaderError || gErr;
 
   return (
     <>
       {/* OPERATÖR KARAR POPUP */}
       {pwPopup && pwPhase === "WORKING" && (
         <div style={{ position: "fixed", bottom: 24, right: 24, zIndex: 10000, background: "#0d1829", border: "2px solid #f59e0b", borderRadius: 10, padding: "1rem 1.25rem", minWidth: 260, boxShadow: "0 0 30px rgba(245,158,11,0.35)", fontFamily: "'JetBrains Mono','Fira Code',monospace" }}>
-          <div style={{ fontSize: "0.7rem", fontWeight: 800, color: "#f59e0b", marginBottom: "0.6rem" }}>🎯 HEDEFE ULAŞILDI — KARAR VERİN</div>
+          <div style={{ fontSize: "0.7rem", fontWeight: 800, color: "#f59e0b", marginBottom: "0.6rem" }}>🎯 HEDEFE ULAŞILDI → KARAR VERİN</div>
           <div style={{ fontSize: "0.6rem", color: "#94a3b8", marginBottom: "0.9rem" }}>Robot hassas işlem bölgesinde bekliyor.</div>
           <div style={{ display: "flex", gap: "0.5rem" }}>
-            <button onClick={() => sendOperatorCmd("return_home")} style={{ flex: 1, padding: "0.5rem 0.25rem", background: "rgba(239,68,68,0.15)", border: "1px solid #ef4444", borderRadius: "0.3rem", color: "#ef4444", cursor: "pointer", fontSize: "0.65rem", fontWeight: 700 }}>🔄 Geri Dön</button>
+            <button onClick={() => sendOperatorCmd("return_home")} style={{ flex: 1, padding: "0.5rem 0.25rem", background: "rgba(239,68,68,0.15)", border: "1px solid #ef4444", borderRadius: "0.3rem", color: "#ef4444", cursor: "pointer", fontSize: "0.65rem", fontWeight: 700 }}>↩ Geri Dön</button>
             <button onClick={() => sendOperatorCmd("continue")} style={{ flex: 1, padding: "0.5rem 0.25rem", background: "rgba(16,185,129,0.15)", border: "1px solid #10b981", borderRadius: "0.3rem", color: "#10b981", cursor: "pointer", fontSize: "0.65rem", fontWeight: 700 }}>▶ Devam Et</button>
           </div>
         </div>
       )}
       {pwPhase === "MOVING" && !pwPopup && (
         <div style={{ position: "fixed", bottom: 24, right: 24, zIndex: 10000, background: "#0d1829", border: "2px solid #3b82f6", borderRadius: 10, padding: "0.75rem 1.25rem", minWidth: 240, fontFamily: "'JetBrains Mono','Fira Code',monospace" }}>
-          <div style={{ fontSize: "0.7rem", fontWeight: 800, color: "#3b82f6" }}>🚀 HEDEFE GİDİYOR...</div>
+          <div style={{ fontSize: "0.7rem", fontWeight: 800, color: "#3b82f6" }}>→ HEDEFE GİDİYOR...</div>
         </div>
       )}
       {pwPhase === "RESUMING" && (
         <div style={{ position: "fixed", bottom: 24, right: 24, zIndex: 10000, background: "#0d1829", border: "2px solid #3b82f6", borderRadius: 10, padding: "0.75rem 1.25rem", minWidth: 240, fontFamily: "'JetBrains Mono','Fira Code',monospace" }}>
-          <div style={{ fontSize: "0.7rem", fontWeight: 800, color: "#3b82f6" }}>🔄 BAŞLANGIÇA DÖNÜYOR...</div>
+          <div style={{ fontSize: "0.7rem", fontWeight: 800, color: "#3b82f6" }}>↩ BAŞLANGIÇA DÖNÜYOR...</div>
         </div>
       )}
 
@@ -653,11 +790,11 @@ export default function CoveragePage() {
         {/* HEADER */}
         <div style={{ flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
           <div style={{ display: "flex", alignItems: "center", gap: "0.6rem" }}>
-            <span style={{ fontSize: "1.3rem" }}>🌾</span>
+            <span style={{ fontSize: "1.3rem" }}>🗺</span>
             <h1 style={{ margin: 0, fontSize: "0.95rem", fontWeight: "800", letterSpacing: "0.15em", color: "#e2e8f0" }}>COVERAGE PLANNER</h1>
           </div>
           <div style={{ display: "flex", gap: "0.4rem", alignItems: "center" }}>
-            {!isConnected ? <button onClick={reconnect} style={bS("#2563eb")}>🔌 Bağlan</button> : <span style={{ fontSize: "0.65rem", color: "#10b981", fontWeight: "700" }}>● ROS BAĞLI</span>}
+            {!isConnected ? <button onClick={reconnect} style={bS("#2563eb")}>⟳ Bağlan</button> : <span style={{ fontSize: "0.65rem", color: "#10b981", fontWeight: "700" }}>● ROS BAĞLI</span>}
             <button onClick={() => setShowSettings(v => !v)} style={bS("#1e293b", "1px solid #334155")}>⚙ Ayarlar</button>
           </div>
         </div>
@@ -668,23 +805,23 @@ export default function CoveragePage() {
           <span style={{ fontSize: "0.7rem", color: "#94a3b8", flex: 1 }}>{displayStatus}</span>
           <span style={{ fontSize: "0.6rem", color: statusColor, fontWeight: "700", padding: "0.1rem 0.5rem", border: `1px solid ${statusColor}33`, borderRadius: "4px" }}>{execStatus}</span>
           {displayError && <span style={{ fontSize: "0.65rem", color: "#f87171" }}>⚠ {displayError}</span>}
-          {robotPose && <span style={{ fontSize: "0.65rem", color: "#facc15", fontWeight: "600", marginLeft: "auto" }}>🤖 [{poseSource}] x:{robotPose.x.toFixed(2)} y:{robotPose.y.toFixed(2)} θ:{(robotPose.yaw * 180 / Math.PI).toFixed(1)}°</span>}
+          {robotPose && <span style={{ fontSize: "0.65rem", color: "#facc15", fontWeight: "600", marginLeft: "auto" }}>⊕ [{poseSource}] x:{robotPose.x.toFixed(2)} y:{robotPose.y.toFixed(2)} θ:{(robotPose.yaw * 180 / Math.PI).toFixed(1)}°</span>}
         </div>
 
         {/* SETTINGS */}
         {showSettings && (
           <div style={{ flexShrink: 0, background: "#0d1829", borderRadius: "0.4rem", padding: "0.75rem", border: "1px solid #1e3a5f", display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(130px,1fr))", gap: "0.6rem" }}>
             <div><div style={lS}>MAP TOPIC</div><input type="text" value={mapTopicName} onChange={e => setMapTopicName(e.target.value)} style={iS} /></div>
-            <div><div style={lS}>STİL</div><select value={style} onChange={e => setStyle(e.target.value)} style={iS}><option value="zigzag">↔ Zigzag</option><option value="ladder">↕ Ladder</option><option value="diagonal">↗ Diagonal</option></select></div>
+            <div><div style={lS}>STİL</div><select value={style} onChange={e => setStyle(e.target.value)} style={iS}><option value="zigzag">↔ Zigzag</option><option value="ladder">↕ Ladder</option><option value="diagonal">⤢ Diagonal</option></select></div>
             <div>
               <div style={lS}>ARALIK (m)</div>
               <input type="number" min="0.05" max="5" step="0.05" value={lineSpacing} onChange={e => setLineSpacing(Number(e.target.value))} style={iS} />
-              {points.length === 4 && <div style={{ fontSize: "0.55rem", marginTop: "0.1rem", color: estimatedLines < 2 ? "#ef4444" : estimatedLines < 4 ? "#f97316" : "#10b981" }}>≈ {estimatedLines} çizgi{estimatedLines < 2 ? " — çok büyük!" : ""}</div>}
+              {points.length === 4 && <div style={{ fontSize: "0.55rem", marginTop: "0.1rem", color: estimatedLines < 2 ? "#ef4444" : estimatedLines < 4 ? "#f97316" : "#10b981" }}>≈ {estimatedLines} çizgi{estimatedLines < 2 ? " ⚠ çok büyük!" : ""}</div>}
             </div>
             <div><div style={lS}>SWEEP (°)</div><input type="number" min="0" max="180" step="5" value={sweepAngle} onChange={e => setSweepAngle(Number(e.target.value))} style={iS} /></div>
             <div><div style={lS}>BAŞLANGIÇ KÖŞESİ</div><select value={startCorner} onChange={e => setStartCorner(Number(e.target.value))} style={iS}>{[0, 1, 2, 3].map(v => <option key={v} value={v}>Köşe {v + 1}</option>)}</select></div>
             <div style={{ display: "flex", flexDirection: "column", gap: "0.4rem", justifyContent: "flex-end" }}>
-              <button onClick={recompute} disabled={!isConnected} style={bS(isConnected ? "#1d4ed8" : "#1e293b")}>📤 Uygula + Recompute</button>
+              <button onClick={recompute} disabled={!isConnected} style={bS(isConnected ? "#1d4ed8" : "#1e293b")}>↻ Uygula + Recompute</button>
               <label style={{ display: "flex", alignItems: "center", gap: "0.4rem", fontSize: "0.65rem", color: "#94a3b8", cursor: "pointer" }}><input type="checkbox" checked={showPreview} onChange={e => setShowPreview(e.target.checked)} /> Preview</label>
             </div>
           </div>
@@ -698,62 +835,109 @@ export default function CoveragePage() {
 
             {/* Executor indicator */}
             <div style={{ padding: "0.4rem 0.5rem", borderRadius: "0.3rem", background: executorAvailable ? "rgba(16,185,129,0.07)" : "rgba(245,158,11,0.07)", border: `1px solid ${executorAvailable ? "#064e3b" : "#78350f"}`, fontSize: "0.6rem" }}>
-              {executorAvailable ? <span style={{ color: "#10b981" }}>✓ C++ Executor bağlı — Nav2 waypoint takibi aktif</span> : <span style={{ color: "#f59e0b" }}>⚠ C++ Executor yok — JS fallback kullanılacak</span>}
+              {executorAvailable ? <span style={{ color: "#10b981" }}>✓ C++ Executor bağlı → Nav2 takibi aktif</span> : <span style={{ color: "#f59e0b" }}>⚠ C++ Executor yok → JS fallback kullanılacak</span>}
             </div>
 
-            {/* Map source (useMapLoader) */}
+            {/* Map source */}
             {mapSource && (
               <div style={{ padding: "0.3rem 0.5rem", borderRadius: "0.3rem", background: "rgba(96,165,250,0.07)", border: "1px solid #1e3a5f", fontSize: "0.55rem", color: "#60a5fa" }}>
-                🗺 {mapSource}
+                🛰 {mapSource}
               </div>
             )}
 
-            {/* Style */}
-            <div>
-              <div style={lS}>COVERAGE STİLİ</div>
-              <div style={{ display: "flex", gap: "0.3rem" }}>
-                {[{ n: "zigzag", i: "↔" }, { n: "ladder", i: "↕" }, { n: "diagonal", i: "↗" }].map(s => (
-                  <button key={s.n} onClick={() => setStyle(s.n)} style={{ flex: 1, padding: "0.4rem 0.1rem", background: style === s.n ? "#1d4ed8" : "#162032", border: style === s.n ? "1px solid #3b82f6" : "1px solid #1e293b", borderRadius: "0.25rem", color: "white", cursor: "pointer", fontSize: "0.58rem", fontWeight: style === s.n ? "700" : "400" }}>{s.i} {s.n}</button>
-                ))}
+            {/* ÇİZİM MODU seçici (YENİ) */}
+            <div style={cS}>
+              <div style={lS}>ÇİZİM MODU</div>
+              <div style={{ display: "flex", gap: "0.25rem" }}>
+                <button
+                  onClick={() => { setActiveMode(m => m === MODE_SELECT ? MODE_IDLE : MODE_SELECT); }}
+                  style={{ flex: 1, padding: "0.45rem 0.2rem", background: activeMode === MODE_SELECT ? "#1d4ed8" : "#162032", border: activeMode === MODE_SELECT ? "1px solid #3b82f6" : "1px solid #1e293b", borderRadius: "0.25rem", color: "white", cursor: "pointer", fontSize: "0.58rem", fontWeight: activeMode === MODE_SELECT ? "700" : "400" }}>
+                  ▱ Polygon (oto-sweep)
+                </button>
+                <button
+                  onClick={() => { setActiveMode(m => m === MODE_MANUAL ? MODE_IDLE : MODE_MANUAL); }}
+                  style={{ flex: 1, padding: "0.45rem 0.2rem", background: activeMode === MODE_MANUAL ? "#b45309" : "#162032", border: activeMode === MODE_MANUAL ? "1px solid #f59e0b" : "1px solid #1e293b", borderRadius: "0.25rem", color: "white", cursor: "pointer", fontSize: "0.58rem", fontWeight: activeMode === MODE_MANUAL ? "700" : "400" }}>
+                  ✏ Manuel Path
+                </button>
               </div>
+              {activeMode === MODE_MANUAL && (
+                <div style={{ fontSize: "0.55rem", color: "#64748b", marginTop: "0.4rem", lineHeight: "1.6" }}>
+                  Haritaya tıkla → nokta eklenir, düz çizgilerle bağlanır. Min 2 nokta. Sonra "Path Gönder" → "Coverage Başlat".
+                </div>
+              )}
             </div>
 
-            {/* Spacing */}
-            <div style={cS}>
-              <div style={lS}>ARALIK — <span style={{ color: estimatedLines < 2 ? "#ef4444" : estimatedLines < 4 ? "#f97316" : "#10b981" }}>≈ {estimatedLines || "?"} çizgi</span></div>
-              <div style={{ display: "flex", gap: "0.3rem", alignItems: "center" }}>
-                <button onClick={() => setLineSpacing(v => Math.max(0.05, +(v - 0.05).toFixed(2)))} style={{ ...bS("#162032", "1px solid #1e293b"), padding: "0.2rem 0.6rem", fontSize: "1rem" }}>−</button>
-                <span style={{ flex: 1, textAlign: "center", fontSize: "0.9rem", fontWeight: "700" }}>{lineSpacing.toFixed(2)}<span style={{ fontSize: "0.55rem", color: "#475569" }}> m</span></span>
-                <button onClick={() => setLineSpacing(v => Math.min(5, +(v + 0.05).toFixed(2)))} style={{ ...bS("#162032", "1px solid #1e293b"), padding: "0.2rem 0.6rem", fontSize: "1rem" }}>+</button>
-              </div>
-            </div>
+            {/* Polygon ayarları — sadece manuel modda DEĞİLKEN */}
+            {activeMode !== MODE_MANUAL && (
+              <>
+                {/* Style */}
+                <div>
+                  <div style={lS}>COVERAGE STİLİ</div>
+                  <div style={{ display: "flex", gap: "0.3rem" }}>
+                    {[{ n: "zigzag", i: "↔" }, { n: "ladder", i: "↕" }, { n: "diagonal", i: "⤢" }].map(s => (
+                      <button key={s.n} onClick={() => setStyle(s.n)} style={{ flex: 1, padding: "0.4rem 0.1rem", background: style === s.n ? "#1d4ed8" : "#162032", border: style === s.n ? "1px solid #3b82f6" : "1px solid #1e293b", borderRadius: "0.25rem", color: "white", cursor: "pointer", fontSize: "0.58rem", fontWeight: style === s.n ? "700" : "400" }}>{s.i} {s.n}</button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Spacing */}
+                <div style={cS}>
+                  <div style={lS}>ARALIK ≈ <span style={{ color: estimatedLines < 2 ? "#ef4444" : estimatedLines < 4 ? "#f97316" : "#10b981" }}>≈ {estimatedLines || "?"} çizgi</span></div>
+                  <div style={{ display: "flex", gap: "0.3rem", alignItems: "center" }}>
+                    <button onClick={() => setLineSpacing(v => Math.max(0.05, +(v - 0.05).toFixed(2)))} style={{ ...bS("#162032", "1px solid #1e293b"), padding: "0.2rem 0.6rem", fontSize: "1rem" }}>−</button>
+                    <span style={{ flex: 1, textAlign: "center", fontSize: "0.9rem", fontWeight: "700" }}>{lineSpacing.toFixed(2)}<span style={{ fontSize: "0.55rem", color: "#475569" }}> m</span></span>
+                    <button onClick={() => setLineSpacing(v => Math.min(5, +(v + 0.05).toFixed(2)))} style={{ ...bS("#162032", "1px solid #1e293b"), padding: "0.2rem 0.6rem", fontSize: "1rem" }}>+</button>
+                  </div>
+                </div>
+
+                {/* Optimizasyon */}
+                <div style={cS}>
+                  <div style={lS}>OPTİMİZASYON</div>
+                  <label style={{ display: "flex", alignItems: "center", gap: "0.4rem", fontSize: "0.6rem", color: "#94a3b8", cursor: "pointer", padding: "0.2rem 0" }}>
+                    <input type="checkbox" checked={autoOrient} onChange={e => setAutoOrient(e.target.checked)} />
+                    Auto-Orient (en uzun kenara hizala)
+                  </label>
+                  <label style={{ display: "flex", alignItems: "center", gap: "0.4rem", fontSize: "0.6rem", color: "#94a3b8", cursor: "pointer", padding: "0.2rem 0" }}>
+                    <input type="checkbox" checked={perimeterPass} onChange={e => setPerimeterPass(e.target.checked)} />
+                    Perimeter Pass (önce kenar)
+                  </label>
+                  <div style={{ marginTop: "0.4rem" }}>
+                    <div style={{ fontSize: "0.55rem", color: "#475569" }}>MARGIN (içe buffer): <span style={{ color: "#10b981" }}>{margin.toFixed(2)}m</span></div>
+                    <input type="range" min="0" max="0.5" step="0.05" value={margin} onChange={e => setMargin(parseFloat(e.target.value))} style={{ width: "100%" }} />
+                  </div>
+                  <div style={{ marginTop: "0.4rem" }}>
+                    <div style={{ fontSize: "0.55rem", color: "#475569" }}>DENSITY (FollowPath ara nokta): <span style={{ color: "#10b981" }}>{pointDensity.toFixed(2)}m</span></div>
+                    <input type="range" min="0.05" max="0.30" step="0.05" value={pointDensity} onChange={e => setPointDensity(parseFloat(e.target.value))} style={{ width: "100%" }} />
+                  </div>
+                </div>
+              </>
+            )}
 
             <div style={{ borderTop: "1px solid #162032" }} />
 
-            {/* Modes */}
-            <div>
-              <div style={lS}>MOD SEÇ</div>
-              <div style={{ display: "flex", flexDirection: "column", gap: "0.3rem" }}>
-                <button onClick={() => setActiveMode(m => m === MODE_SELECT ? MODE_IDLE : MODE_SELECT)} style={{ padding: "0.55rem 0.5rem", textAlign: "left", background: activeMode === MODE_SELECT ? "rgba(249,115,22,0.12)" : "#162032", border: `1px solid ${activeMode === MODE_SELECT ? "#f97316" : "#1e293b"}`, borderRadius: "0.3rem", color: activeMode === MODE_SELECT ? "#f97316" : "#94a3b8", cursor: "pointer", fontSize: "0.7rem", fontWeight: "700" }}>
-                  {activeMode === MODE_SELECT ? "✅" : "⬜"} Alan Seçimi ({points.length}/4)
-                </button>
-                <button onClick={() => { if (!isConnected) { setPageError("Bağlanın"); return; } setGoalEnabled(v => !v); goalDragRef.current = null; setGoalDragEnd(null); }} style={{ padding: "0.55rem 0.5rem", textAlign: "left", background: goalEnabled ? "rgba(168,85,247,0.12)" : "#162032", border: `1px solid ${goalEnabled ? "#a855f7" : "#1e293b"}`, borderRadius: "0.3rem", color: goalEnabled ? "#c084fc" : "#94a3b8", cursor: "pointer", fontSize: "0.7rem", fontWeight: "700" }}>
-                  {goalEnabled ? "🟣" : "⬜"} 2D Nav Goal
-                </button>
-                <button onClick={() => { if (!isConnected) { setPageError("Bağlanın"); return; } setPrecisionEnabled(v => !v); goalDragRef.current = null; setGoalDragEnd(null); }} style={{ padding: "0.55rem 0.5rem", textAlign: "left", background: precisionEnabled ? "rgba(245,158,11,0.12)" : "#162032", border: `1px solid ${precisionEnabled ? "#f59e0b" : "#1e293b"}`, borderRadius: "0.3rem", color: precisionEnabled ? "#f59e0b" : "#94a3b8", cursor: "pointer", fontSize: "0.7rem", fontWeight: "700" }}>
-                  {precisionEnabled ? "🟡" : "⬜"} 🎯 Hassas İşlem
-                </button>
-                <button onClick={() => { if (!isConnected) { setPageError("Bağlanın"); return; } setOffsetEnabled(v => !v); if (otStatus === "RUNNING") stopOffsetTracking(); goalDragRef.current = null; setGoalDragEnd(null); }} style={{ padding: "0.55rem 0.5rem", textAlign: "left", background: offsetEnabled ? "rgba(14,165,233,0.12)" : "#162032", border: `1px solid ${offsetEnabled ? "#0ea5e9" : "#1e293b"}`, borderRadius: "0.3rem", color: offsetEnabled ? "#0ea5e9" : "#94a3b8", cursor: "pointer", fontSize: "0.7rem", fontWeight: "700" }}>
-                  {offsetEnabled ? "🔵" : "⬜"} 📐 Offset Takibi
-                  {otStatus === "RUNNING" && <span style={{ marginLeft: "0.4rem", fontSize: "0.55rem", color: "#0ea5e9", background: "rgba(14,165,233,0.15)", padding: "0.05rem 0.3rem", borderRadius: 3 }}>RUNNING</span>}
-                </button>
+            {/* Diğer Modlar (Goal/Precision/Offset) — manuel modda gizle */}
+            {activeMode !== MODE_MANUAL && (
+              <div>
+                <div style={lS}>EK MODLAR</div>
+                <div style={{ display: "flex", flexDirection: "column", gap: "0.3rem" }}>
+                  <button onClick={() => { if (!isConnected) { setPageError("Bağlanın"); return; } setGoalEnabled(v => !v); goalDragRef.current = null; setGoalDragEnd(null); }} style={{ padding: "0.55rem 0.5rem", textAlign: "left", background: goalEnabled ? "rgba(168,85,247,0.12)" : "#162032", border: `1px solid ${goalEnabled ? "#a855f7" : "#1e293b"}`, borderRadius: "0.3rem", color: goalEnabled ? "#c084fc" : "#94a3b8", cursor: "pointer", fontSize: "0.7rem", fontWeight: "700" }}>
+                    {goalEnabled ? "■" : "□"} 2D Nav Goal
+                  </button>
+                  <button onClick={() => { if (!isConnected) { setPageError("Bağlanın"); return; } setPrecisionEnabled(v => !v); goalDragRef.current = null; setGoalDragEnd(null); }} style={{ padding: "0.55rem 0.5rem", textAlign: "left", background: precisionEnabled ? "rgba(245,158,11,0.12)" : "#162032", border: `1px solid ${precisionEnabled ? "#f59e0b" : "#1e293b"}`, borderRadius: "0.3rem", color: precisionEnabled ? "#f59e0b" : "#94a3b8", cursor: "pointer", fontSize: "0.7rem", fontWeight: "700" }}>
+                    {precisionEnabled ? "■" : "□"} ◎ Hassas İşlem
+                  </button>
+                  <button onClick={() => { if (!isConnected) { setPageError("Bağlanın"); return; } setOffsetEnabled(v => !v); if (otStatus === "RUNNING") stopOffsetTracking(); goalDragRef.current = null; setGoalDragEnd(null); }} style={{ padding: "0.55rem 0.5rem", textAlign: "left", background: offsetEnabled ? "rgba(14,165,233,0.12)" : "#162032", border: `1px solid ${offsetEnabled ? "#0ea5e9" : "#1e293b"}`, borderRadius: "0.3rem", color: offsetEnabled ? "#0ea5e9" : "#94a3b8", cursor: "pointer", fontSize: "0.7rem", fontWeight: "700" }}>
+                    {offsetEnabled ? "■" : "□"} ↗ Offset Takibi
+                    {otStatus === "RUNNING" && <span style={{ marginLeft: "0.4rem", fontSize: "0.55rem", color: "#0ea5e9", background: "rgba(14,165,233,0.15)", padding: "0.05rem 0.3rem", borderRadius: 3 }}>RUNNING</span>}
+                  </button>
+                </div>
               </div>
-            </div>
+            )}
 
             {/* Offset Tracking ayarları */}
-            {offsetEnabled && (
+            {offsetEnabled && activeMode !== MODE_MANUAL && (
               <div style={{ ...cS, border: `1px solid ${otStatus === "RUNNING" ? "rgba(14,165,233,0.4)" : "#1e3a5f"}`, background: "rgba(14,165,233,0.03)" }}>
-                <div style={{ ...lS, color: "#0ea5e9" }}>📐 OFFSETTAKİBİ AYARLARI</div>
+                <div style={{ ...lS, color: "#0ea5e9" }}>↗ OFFSET TAKİBİ AYARLARI</div>
                 <div style={{ fontSize: "0.58rem", color: "#475569", marginBottom: "0.4rem" }}>Haritadan 2D Nav Goal ile hedef seçince robot mevcut konumdan o noktaya offset mesafede gider.</div>
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.3rem", marginBottom: "0.3rem" }}>
                   <div><div style={lS}>OFFSET (m)</div><input type="text" inputMode="decimal" value={otOffset} onChange={e => setOtOffset(e.target.value)} style={{ ...iS, fontSize: "0.65rem" }} /></div>
@@ -765,18 +949,27 @@ export default function CoveragePage() {
                     {["left", "right"].map(s => (<button key={s} onClick={() => setOtSide(s)} style={{ flex: 1, ...bS(otSide === s ? "#1d4ed8" : "#162032", otSide === s ? "1px solid #3b82f6" : "1px solid #1e293b"), fontSize: "0.6rem" }}>{s === "left" ? "← SOL" : "SAĞ →"}</button>))}
                   </div>
                 </div>
-                {otStatus === "RUNNING" && <button onClick={stopOffsetTracking} style={{ ...bS("#7f1d1d", "1px solid #ef4444"), width: "100%", fontSize: "0.65rem", color: "#fca5a5", marginBottom: "0.3rem" }}>⛔ Offset Takibini Durdur</button>}
+                {otStatus === "RUNNING" && <button onClick={stopOffsetTracking} style={{ ...bS("#7f1d1d", "1px solid #ef4444"), width: "100%", fontSize: "0.65rem", color: "#fca5a5", marginBottom: "0.3rem" }}>⏹ Offset Takibini Durdur</button>}
                 {otLog && <div style={{ fontSize: "0.52rem", color: "#334155", wordBreak: "break-all", marginTop: "0.2rem" }}>{otLog}</div>}
               </div>
             )}
 
             <div style={{ borderTop: "1px solid #162032" }} />
 
-            {/* Points */}
-            <div style={cS}>
-              <div style={lS}>NOKTALAR <span style={{ color: points.length === 4 ? "#10b981" : "#f97316" }}>{points.length}/4</span></div>
-              {points.length === 0 ? <div style={{ fontSize: "0.6rem", color: "#1e293b" }}>Alan seçimde tıkla</div> : points.map((p, i) => <div key={i} style={{ fontSize: "0.6rem", color: i === startCorner ? "#22c55e" : "#60a5fa", lineHeight: "1.8" }}>{i + 1}: ({p.x.toFixed(2)}, {p.y.toFixed(2)}) {i === startCorner ? "⭐" : ""}</div>)}
-            </div>
+            {/* NOKTALAR — moda göre polygon veya manuel */}
+            {activeMode === MODE_MANUAL ? (
+              <div style={cS}>
+                <div style={lS}>MANUEL NOKTALAR <span style={{ color: manualPoints.length >= 2 ? "#10b981" : "#f59e0b" }}>{manualPoints.length}</span></div>
+                {manualPoints.length === 0
+                  ? <div style={{ fontSize: "0.6rem", color: "#1e293b" }}>Haritaya tıkla</div>
+                  : manualPoints.map((p, i) => <div key={i} style={{ fontSize: "0.6rem", color: i === 0 ? "#22c55e" : i === manualPoints.length - 1 ? "#f87171" : "#f59e0b", lineHeight: "1.7" }}>{i + 1}: ({p.x.toFixed(2)}, {p.y.toFixed(2)}) {i === 0 ? "⭐ start" : i === manualPoints.length - 1 ? "● end" : ""}</div>)}
+              </div>
+            ) : (
+              <div style={cS}>
+                <div style={lS}>NOKTALAR <span style={{ color: points.length === 4 ? "#10b981" : "#f97316" }}>{points.length}/4</span></div>
+                {points.length === 0 ? <div style={{ fontSize: "0.6rem", color: "#1e293b" }}>Alan seçimde tıkla</div> : points.map((p, i) => <div key={i} style={{ fontSize: "0.6rem", color: i === startCorner ? "#22c55e" : "#60a5fa", lineHeight: "1.8" }}>{i + 1}: ({p.x.toFixed(2)}, {p.y.toFixed(2)}) {i === startCorner ? "⭐" : ""}</div>)}
+              </div>
+            )}
 
             {/* Robot */}
             <div style={cS}>
@@ -787,7 +980,7 @@ export default function CoveragePage() {
             {/* Path info */}
             {pathMsg?.poses?.length > 0 && (
               <div style={{ ...cS, border: "1px solid #064e3b" }}>
-                <div style={lS}>ROS PATH ✅</div>
+                <div style={lS}>ROS PATH ✓</div>
                 <div style={{ fontSize: "0.65rem", color: "#10b981", fontWeight: "700" }}>{pathMsg.poses.length} waypoint</div>
                 <div style={{ fontSize: "0.5rem", color: "#475569" }}>frame: {pathMsg.header?.frame_id || "?"}</div>
               </div>
@@ -795,51 +988,78 @@ export default function CoveragePage() {
 
             <div style={{ flex: 1 }} />
 
-            {/* Execution mode */}
-            <div style={cS}>
-              <div style={lS}>NAV2 MODU (C++ Executor)</div>
-              <div style={{ display: "flex", flexDirection: "column", gap: "0.2rem" }}>
-                {[{ k: "navigate_through_poses", l: "NavigateThroughPoses", d: "RViz gibi — tüm WP sırayla", c: "#3b82f6" }, { k: "sequential", l: "Sequential", d: "Her WP ayrı NavigateToPose", c: "#10b981" }].map(m => (
-                  <button key={m.k} onClick={() => setExecMode(m.k)} style={{ padding: "0.4rem 0.5rem", textAlign: "left", background: execMode === m.k ? `${m.c}22` : "#0a1020", border: `1px solid ${execMode === m.k ? m.c : "#162032"}`, borderRadius: "0.25rem", color: execMode === m.k ? m.c : "#475569", cursor: "pointer", fontSize: "0.58rem", fontWeight: execMode === m.k ? "700" : "400" }}>
-                    {execMode === m.k ? "◉" : "○"} {m.l}<div style={{ fontSize: "0.5rem", color: "#334155", marginTop: "0.1rem" }}>{m.d}</div>
+            {/* Execution mode — manuel modda gizle (her zaman follow_path) */}
+            {activeMode !== MODE_MANUAL && (
+              <div style={cS}>
+                <div style={lS}>NAV2 MODU (C++ Executor)</div>
+                {[
+                  { k: "follow_path", l: "FollowPath  ⭐", d: "Path RPP'ye verilir, geometrik takip. Coverage için optimal." },
+                  { k: "navigate_through_poses", l: "NavigateThroughPoses", d: "Sparse waypoint listesi. xy_goal_tolerance < line_spacing olmalı." },
+                  { k: "sequential", l: "Sequential", d: "Her WP ayrı goal. Yavaş, en güvenilir." },
+                ].map(m => (
+                  <button key={m.k} onClick={() => setExecMode(m.k)} style={{ ...bS(execMode === m.k ? "#1d4ed8" : "#0f1729", execMode === m.k ? "1px solid #3b82f6" : "1px solid #1e293b"), padding: "0.5rem", marginTop: "0.25rem", textAlign: "left", fontSize: "0.6rem", fontWeight: execMode === m.k ? "700" : "400" }}>
+                    {execMode === m.k ? "◉" : "○"} {m.l}
+                    <div style={{ fontSize: "0.5rem", color: "#334155", marginTop: "0.1rem" }}>{m.d}</div>
                   </button>
                 ))}
               </div>
-            </div>
+            )}
 
             {/* Progress */}
             {(isRunning || execStatus === "COMPLETED") && (
               <div style={{ ...cS, border: `1px solid ${execStatus === "COMPLETED" ? "#064e3b" : "#1d4ed8"}` }}>
-                <div style={lS}>İLERLEME — <span style={{ color: statusColor }}>{execStatus === "COMPLETED" ? "✅ Tamamlandı" : `${wpDone}/${wpTotal} WP`}</span></div>
+                <div style={lS}>İLERLEME → <span style={{ color: statusColor }}>{execStatus === "COMPLETED" ? "✓ Tamamlandı" : `${wpDone}/${wpTotal} WP`}</span></div>
                 <div style={{ height: "6px", background: "#0a1020", borderRadius: "3px", overflow: "hidden", marginTop: "0.3rem" }}><div style={{ width: `${Math.round(progressPct * 100)}%`, height: "100%", background: execStatus === "COMPLETED" ? "#10b981" : "#3b82f6", borderRadius: "3px", transition: "width 0.4s" }} /></div>
                 <div style={{ fontSize: "0.55rem", color: "#475569", marginTop: "0.2rem" }}>{Math.round(progressPct * 100)}%</div>
               </div>
             )}
 
-            {/* BUTTONS */}
+            {/* BUTTONS — moda göre */}
             <div style={{ display: "flex", flexDirection: "column", gap: "0.35rem" }}>
-              <div style={{ fontSize: "0.5rem", color: "#334155", marginBottom: "0.1rem" }}>ADIM 1 — PLANNER'A GÖNDER</div>
-              <button onClick={publishPolygon} disabled={points.length !== 4 || !isConnected} style={{ ...bS(points.length === 4 && isConnected ? "#065f46" : "#162032"), padding: "0.65rem", fontSize: "0.75rem", opacity: points.length === 4 && isConnected ? 1 : 0.4 }}>📐 Polygon Gönder → Planner</button>
-              <div style={{ fontSize: "0.5rem", color: "#334155", marginBottom: "0.1rem" }}>ADIM 2 — NAV2'YE GÖNDER</div>
-              <button onClick={startCoverage} disabled={!isConnected || isRunning} style={{ ...bS(isRunning ? "#1d4ed8" : "#7c3aed"), padding: "0.75rem", fontSize: "0.8rem", fontWeight: "800", opacity: isConnected ? 1 : 0.4 }}>{isRunning ? `🏃 ${wpDone}/${wpTotal} WP...` : "🚀 Coverage Başlat"}</button>
-              <button onClick={cancelCoverage} disabled={!isRunning} style={{ ...bS(isRunning ? "#991b1b" : "#162032", isRunning ? "1px solid #ef4444" : "1px solid #1e293b"), padding: "0.7rem", fontSize: "0.75rem", fontWeight: "800", opacity: isRunning ? 1 : 0.35, color: isRunning ? "#fca5a5" : "#475569" }}>⛔ Durdur</button>
-              <button onClick={clearAll} style={{ ...bS("transparent", "1px solid #1e293b"), padding: "0.4rem", fontSize: "0.65rem", color: "#475569" }}>🗑 Temizle</button>
+              {activeMode === MODE_MANUAL ? (
+                <>
+                  <div style={{ fontSize: "0.5rem", color: "#334155", marginBottom: "0.1rem" }}>MANUEL PATH ({manualPoints.length} nokta)</div>
+                  <button onClick={undoManualPoint} disabled={manualPoints.length === 0} style={{ ...bS("#162032", "1px solid #1e293b"), padding: "0.5rem", fontSize: "0.7rem", opacity: manualPoints.length === 0 ? 0.4 : 1 }}>↶ Son Noktayı Geri Al</button>
+                  <button onClick={publishManualPath} disabled={manualPoints.length < 2 || !isConnected} style={{ ...bS(manualPoints.length >= 2 && isConnected ? "#b45309" : "#162032", manualPoints.length >= 2 && isConnected ? "1px solid #f59e0b" : "1px solid #1e293b"), padding: "0.65rem", fontSize: "0.75rem", fontWeight: "800", opacity: manualPoints.length >= 2 && isConnected ? 1 : 0.4 }}>📍 Path Gönder</button>
+                  <button onClick={startCoverage} disabled={!isConnected || isRunning} style={{ ...bS(isRunning ? "#1d4ed8" : "#7c3aed"), padding: "0.75rem", fontSize: "0.8rem", fontWeight: "800", opacity: isConnected ? 1 : 0.4 }}>{isRunning ? `▶ ${wpDone}/${wpTotal} WP...` : "▶ Coverage Başlat"}</button>
+                </>
+              ) : (
+                <>
+                  <div style={{ fontSize: "0.5rem", color: "#334155", marginBottom: "0.1rem" }}>ADIM 1 → PLANNER'A GÖNDER</div>
+                  <button onClick={publishPolygon} disabled={points.length !== 4 || !isConnected} style={{ ...bS(points.length === 4 && isConnected ? "#065f46" : "#162032"), padding: "0.65rem", fontSize: "0.75rem", opacity: points.length === 4 && isConnected ? 1 : 0.4 }}>📐 Polygon Gönder → Planner</button>
+                  <div style={{ fontSize: "0.5rem", color: "#334155", marginBottom: "0.1rem" }}>ADIM 2 → NAV2'YE GÖNDER</div>
+                  <button onClick={startCoverage} disabled={!isConnected || isRunning} style={{ ...bS(isRunning ? "#1d4ed8" : "#7c3aed"), padding: "0.75rem", fontSize: "0.8rem", fontWeight: "800", opacity: isConnected ? 1 : 0.4 }}>{isRunning ? `▶ ${wpDone}/${wpTotal} WP...` : "▶ Coverage Başlat"}</button>
+                </>
+              )}
 
-              {/* Haritayı Yenile — useMapLoader QoS fix */}
+              <button onClick={cancelCoverage} disabled={!isRunning} style={{ ...bS(isRunning ? "#991b1b" : "#162032", isRunning ? "1px solid #ef4444" : "1px solid #1e293b"), padding: "0.7rem", fontSize: "0.75rem", fontWeight: "800", opacity: isRunning ? 1 : 0.35, color: isRunning ? "#fca5a5" : "#475569" }}>⏹ Durdur</button>
+              <button onClick={activeMode === MODE_MANUAL ? clearManualPath : clearAll} style={{ ...bS("transparent", "1px solid #1e293b"), padding: "0.4rem", fontSize: "0.65rem", color: "#475569" }}>🗑 {activeMode === MODE_MANUAL ? "Manuel Path Temizle" : "Temizle"}</button>
+
               <button onClick={reloadMap} disabled={!isConnected || mapLoading} style={{ ...bS("#0f2137", "1px solid #1e3a5f"), padding: "0.4rem", fontSize: "0.65rem", color: mapLoading ? "#475569" : "#60a5fa", opacity: isConnected ? 1 : 0.4 }}>
-                {mapLoading ? "⏳ Harita yükleniyor..." : "🗺 Haritayı Yenile"}
+                {mapLoading ? "⏳ Harita yükleniyor..." : "🔄 Haritayı Yenile"}
               </button>
             </div>
 
             {/* Flow guide */}
             <div style={{ fontSize: "0.5rem", color: "#334155", lineHeight: "1.9", borderTop: "1px solid #162032", paddingTop: "0.4rem" }}>
-              <div style={{ color: "#475569", fontWeight: "700" }}>DOĞRU AKIŞ:</div>
-              <div>1 → Stil seç + 4 nokta işaretle</div>
-              <div>2 → 📐 Polygon Gönder (planner path üretir)</div>
-              <div>3 → Path haritada yeşil görünür</div>
-              <div>4 → 🚀 Coverage Başlat</div>
-              <div style={{ color: "#10b981", marginTop: "0.2rem" }}>✓ C++ executor Nav2'yi yönetir</div>
-              <div style={{ color: "#60a5fa", fontSize: "0.48rem" }}>⚠ Executor yoksa JS fallback devreye girer</div>
+              <div style={{ color: "#475569", fontWeight: "700" }}>{activeMode === MODE_MANUAL ? "MANUEL AKIŞ:" : "POLYGON AKIŞ:"}</div>
+              {activeMode === MODE_MANUAL ? (
+                <>
+                  <div>1 → Haritaya nokta nokta tıkla</div>
+                  <div>2 → 📍 Path Gönder (manuel path üretir)</div>
+                  <div>3 → Path haritada yeşil görünür</div>
+                  <div>4 → ▶ Coverage Başlat</div>
+                  <div style={{ color: "#f59e0b", marginTop: "0.2rem" }}>↪ Düz çizgi → robot tam hızda gider</div>
+                </>
+              ) : (
+                <>
+                  <div>1 → Stil seç + 4 nokta işaretle</div>
+                  <div>2 → 📐 Polygon Gönder (planner path üretir)</div>
+                  <div>3 → Path haritada yeşil görünür</div>
+                  <div>4 → ▶ Coverage Başlat</div>
+                  <div style={{ color: "#10b981", marginTop: "0.2rem" }}>↪ C++ executor Nav2'yi yönetir</div>
+                </>
+              )}
             </div>
           </div>
 
@@ -848,10 +1068,11 @@ export default function CoveragePage() {
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "0.4rem", flexShrink: 0, flexWrap: "wrap", gap: "0.3rem" }}>
               <span style={{ fontSize: "0.7rem", fontWeight: "700", color: "#e2e8f0" }}>🗺 HARİTA</span>
               <div style={{ display: "flex", gap: "0.6rem", fontSize: "0.58rem" }}>
-                <span style={{ color: "#f97316" }}>🟠 Alan</span>
-                <span style={{ color: "#3b82f6" }}>🔵 Preview</span>
-                <span style={{ color: "#10b981" }}>🟢 ROS Path (waypoints)</span>
-                <span style={{ color: "#facc15" }}>🟡 Robot</span>
+                {activeMode === MODE_MANUAL
+                  ? <span style={{ color: "#f59e0b" }}>✏ Manuel Path</span>
+                  : <><span style={{ color: "#f97316" }}>▱ Alan</span><span style={{ color: "#3b82f6" }}>→ Preview</span></>}
+                <span style={{ color: "#10b981" }}>⋯ ROS Path</span>
+                <span style={{ color: "#facc15" }}>⊕ Robot</span>
                 <span style={{ color: "#22c55e" }}>● Start</span>
                 <span style={{ color: "#ef4444" }}>● End</span>
               </div>
@@ -867,16 +1088,17 @@ export default function CoveragePage() {
               }
               {mapInfo && <div style={{ position: "absolute", bottom: 5, right: 7, fontSize: "0.55rem", color: "#1e293b" }}>{mapInfo.width}×{mapInfo.height} · {mapInfo.resolution.toFixed(3)}m/px</div>}
               {mapSource && <div style={{ position: "absolute", bottom: 5, left: 7, fontSize: "0.5rem", color: "#1e3a5f" }}>{mapSource}</div>}
-              {activeMode === MODE_SELECT && <div style={{ position: "absolute", top: 6, left: 6, background: "rgba(249,115,22,0.1)", border: "1px solid #f97316", borderRadius: "0.2rem", padding: "0.2rem 0.45rem", fontSize: "0.6rem", color: "#fb923c", fontWeight: "700" }}>✚ ALAN SEÇİMİ ({points.length}/4) — Sol tık: nokta ekle</div>}
-              {(goalEnabled || precisionEnabled || offsetEnabled) && activeMode !== MODE_SELECT && (
+              {activeMode === MODE_SELECT && <div style={{ position: "absolute", top: 6, left: 6, background: "rgba(249,115,22,0.1)", border: "1px solid #f97316", borderRadius: "0.2rem", padding: "0.2rem 0.45rem", fontSize: "0.6rem", color: "#fb923c", fontWeight: "700" }}>▱ ALAN SEÇİMİ ({points.length}/4) → Sol tık: nokta ekle</div>}
+              {activeMode === MODE_MANUAL && <div style={{ position: "absolute", top: 6, left: 6, background: "rgba(245,158,11,0.1)", border: "1px solid #f59e0b", borderRadius: "0.2rem", padding: "0.2rem 0.45rem", fontSize: "0.6rem", color: "#fbbf24", fontWeight: "700" }}>✏ MANUEL PATH ({manualPoints.length} nokta) → Sol tık: nokta ekle</div>}
+              {(goalEnabled || precisionEnabled || offsetEnabled) && activeMode !== MODE_SELECT && activeMode !== MODE_MANUAL && (
                 <div style={{ position: "absolute", top: 6, left: 6, background: "rgba(0,0,0,0.6)", border: "1px solid #334155", borderRadius: "0.2rem", padding: "0.2rem 0.6rem", fontSize: "0.6rem", color: "#e2e8f0", fontWeight: "700", display: "flex", gap: "0.6rem" }}>
-                  {goalEnabled      && <span style={{ color: "#c084fc" }}>🟣 Nav Goal</span>}
-                  {precisionEnabled && <span style={{ color: "#f59e0b" }}>🎯 Hassas İşlem</span>}
-                  {offsetEnabled    && <span style={{ color: "#0ea5e9" }}>📐 Offset Takibi ({otOffset}m {otSide})</span>}
+                  {goalEnabled      && <span style={{ color: "#c084fc" }}>□ Nav Goal</span>}
+                  {precisionEnabled && <span style={{ color: "#f59e0b" }}>◎ Hassas İşlem</span>}
+                  {offsetEnabled    && <span style={{ color: "#0ea5e9" }}>↗ Offset Takibi ({otOffset}m {otSide})</span>}
                   <span style={{ color: "#475569" }}>→ Tıkla + Sürükle yön</span>
                 </div>
               )}
-              {isRunning && <div style={{ position: "absolute", bottom: 24, left: "50%", transform: "translateX(-50%)", background: "rgba(13,24,41,0.9)", border: "1px solid #1d4ed8", borderRadius: "6px", padding: "0.3rem 1rem", fontSize: "0.65rem", color: "#60a5fa", fontWeight: "700" }}>🏃 {execStatus}</div>}
+              {isRunning && <div style={{ position: "absolute", bottom: 24, left: "50%", transform: "translateX(-50%)", background: "rgba(13,24,41,0.9)", border: "1px solid #1d4ed8", borderRadius: "6px", padding: "0.3rem 1rem", fontSize: "0.65rem", color: "#60a5fa", fontWeight: "700" }}>▶ {execStatus}</div>}
             </div>
           </div>
         </div>

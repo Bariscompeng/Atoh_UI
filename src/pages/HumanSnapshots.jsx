@@ -35,13 +35,13 @@ const ts = () => { const n = new Date(); return `${String(n.getHours()).padStart
 
 function classifyMotion(linear, angular) {
   const m = Math.abs(linear) > 0.001 || Math.abs(angular) > 0.001;
-  if (!m) return { label: "BEKLE", color: "#2a4060", icon: "■" };
-  if (Math.abs(linear) > 0.001 && Math.abs(angular) < 0.05) return { label: "İLERİ", color: "#00ff88", icon: "▲" };
-  if (Math.abs(linear) < 0.001 && angular > 0.05) return { label: "SOL DÖN", color: "#00d4ff", icon: "◀" };
-  if (Math.abs(linear) < 0.001 && angular < -0.05) return { label: "SAĞ DÖN", color: "#ff6b9d", icon: "▶" };
+  if (!m) return { label: "BEKLE", color: "#2a4060", icon: "⏹" };
+  if (Math.abs(linear) > 0.001 && Math.abs(angular) < 0.05) return { label: "İLERİ", color: "#00ff88", icon: "⬆" };
+  if (Math.abs(linear) < 0.001 && angular > 0.05) return { label: "SOL DÖN", color: "#00d4ff", icon: "↰" };
+  if (Math.abs(linear) < 0.001 && angular < -0.05) return { label: "SAĞ DÖN", color: "#ff6b9d", icon: "↱" };
   if (linear > 0 && angular > 0.05) return { label: "SOL+İLERİ", color: "#00ff88", icon: "↖" };
   if (linear > 0 && angular < -0.05) return { label: "SAĞ+İLERİ", color: "#00ff88", icon: "↗" };
-  return { label: "HAREKET", color: "#ffd700", icon: "◆" };
+  return { label: "HAREKET", color: "#ffd700", icon: "🔄" };
 }
 
 const CSS = `
@@ -83,7 +83,7 @@ function Section({ title, accent, children }) {
     <div style={{ marginBottom: "0.5rem", border: `1px solid ${accent}20`, borderRadius: "5px", overflow: "hidden" }}>
       <button onClick={() => setOpen(o => !o)} style={{ width: "100%", padding: "0.4rem 0.6rem", background: `${accent}08`, border: "none", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
         <span style={{ fontSize: "0.58rem", fontWeight: "700", color: accent, letterSpacing: "0.12em", textTransform: "uppercase", fontFamily: "'JetBrains Mono',monospace" }}>{title}</span>
-        <span style={{ fontSize: "0.55rem", color: `${accent}88` }}>{open ? "▲" : "▼"}</span>
+        <span style={{ fontSize: "0.55rem", color: `${accent}88` }}>{open ? "▼" : "▶"}</span>
       </button>
       {open && <div style={{ padding: "0.6rem 0.6rem 0.2rem" }}>{children}</div>}
     </div>
@@ -91,7 +91,7 @@ function Section({ title, accent, children }) {
 }
 
 export default function HumanSnapshots() {
-  const { ros, isConnected, status: globalStatus, humanFollowEnabled, toggleHumanFollow } = useROS();
+  const { ros, isConnected, status: globalStatus, humanFollowEnabled, toggleHumanFollow, cameraEnabled, toggleCamera } = useROS();
 
   const defaults = useMemo(() => ({ imageTopic: "/human_debug_snapshot/jpeg", messageType: "sensor_msgs/CompressedImage", throttleMs: 50, fitMode: "contain" }), []);
   const pidDefs = useMemo(() => ({ kp_yaw: 1.2, deadband_x: 0.03, max_angular_z: 1.0, v_max: 0.35, a_go: 0.03, a_stop: 0.12, min_conf: 0.35, target_timeout_sec: 0.35, ex_lowpass_alpha: 1.0, invert_ex: false, ex_offset: 0.0 }), []);
@@ -190,12 +190,20 @@ export default function HumanSnapshots() {
     return () => { try { sub.unsubscribe(); } catch {}; tgtSubRef.current = null; };
   }, [ros, isConnected, addLog]);
 
+  const handleCamera = () => {
+    if (!ros || !isConnected) { setNotice("ERR: ROS BAĞLI DEĞİL"); return; }
+    const next = toggleCamera();
+    addLog({ id: Date.now(), time: ts(), type: "system", 
+             message: next ? "📷 CAMERA ON" : "📷 CAMERA OFF", 
+             color: next ? "#00d4ff" : "#ff8844" });
+  };
+
   const handleToggle = () => {
     if (!ros || !isConnected) { setNotice("ERR: ROS BAĞLI DEĞİL"); return; }
     setPublishing(true); setNotice("");
     try {
       const next = toggleHumanFollow();
-      addLog({ id: Date.now(), time: ts(), type: "system", message: next ? "▶ FOLLOW ON" : "■ FOLLOW OFF", color: next ? "#00ff88" : "#ff4444" });
+      addLog({ id: Date.now(), time: ts(), type: "system", message: next ? "▶ FOLLOW ON" : "⏹ FOLLOW OFF", color: next ? "#00ff88" : "#ff4444" });
       setNotice(next ? "FOLLOW: ACTIVE" : "FOLLOW: STOPPED");
       setTimeout(() => setNotice(""), 2500);
     } catch (e) { setNotice(`ERR: ${e.message}`); }
@@ -231,13 +239,13 @@ export default function HumanSnapshots() {
         {/* Scanline overlay */}
         <div style={{ position: "absolute", inset: 0, background: "repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,212,255,0.006) 3px,rgba(0,212,255,0.006) 4px)", pointerEvents: "none", zIndex: 0 }} />
 
-        {/* ══════ HEADER ══════════════════════════════════════════════ */}
+        {/* ────── HEADER ────────────────────────────────────────────── */}
         <header style={{ flexShrink: 0, padding: "0.45rem 0.85rem", borderBottom: "1px solid #071830", background: "#030b17", display: "flex", alignItems: "center", gap: "0.65rem", zIndex: 20, position: "relative" }}>
 
           {/* Logo */}
           <div style={{ display: "flex", alignItems: "center", gap: "0.55rem" }}>
             <div style={{ position: "relative", width: "32px", height: "32px", border: "1px solid #00d4ff33", borderRadius: "5px", display: "flex", alignItems: "center", justifyContent: "center", background: "#00d4ff06", fontSize: "1rem" }}>
-              🎯
+              👁
               {active && <div style={{ position: "absolute", top: "-2px", right: "-2px", width: "7px", height: "7px", borderRadius: "50%", background: "#00ff88", animation: "hspulse 1.6s infinite" }} />}
             </div>
             <div>
@@ -265,12 +273,48 @@ export default function HumanSnapshots() {
             ))}
           </div>
 
-          {/* CTA buttons — ALWAYS VISIBLE */}
+          {/* CTA buttons */}
           <div style={{ display: "flex", gap: "0.4rem", marginLeft: "0.5rem" }}>
-            <button className="hs-btn" onClick={handleToggle} disabled={publishing || !isConnected}
-              style={{ padding: "0.38rem 0.85rem", borderRadius: "4px", background: humanFollowEnabled ? "#00ff8810" : "#ff444410", border: `1px solid ${humanFollowEnabled ? "#00ff8855" : "#ff444455"}`, color: humanFollowEnabled ? "#00ff88" : "#ff6666", cursor: !isConnected ? "not-allowed" : "pointer", fontSize: "0.72rem", fontWeight: "700", letterSpacing: "0.08em", fontFamily: "'Barlow Condensed',sans-serif", opacity: !isConnected ? 0.4 : 1, boxShadow: humanFollowEnabled ? "0 0 14px #00ff8820" : "none" }}>
-              {publishing ? "···" : humanFollowEnabled ? "● FOLLOW ON" : "○ FOLLOW OFF"}
+            
+            {/* Kamera Butonu */}
+            <button 
+              className="hs-btn" 
+              onClick={handleCamera} 
+              disabled={!isConnected}
+              style={{
+                padding: "0.38rem 0.85rem", borderRadius: "4px",
+                background: cameraEnabled ? "#00d4ff10" : "#33333310",
+                border: `1px solid ${cameraEnabled ? "#00d4ff55" : "#33333355"}`,
+                color: cameraEnabled ? "#00d4ff" : "#888",
+                cursor: !isConnected ? "not-allowed" : "pointer",
+                fontSize: "0.72rem", fontWeight: "700", letterSpacing: "0.08em",
+                fontFamily: "'Barlow Condensed',sans-serif",
+                opacity: !isConnected ? 0.4 : 1,
+                boxShadow: cameraEnabled ? "0 0 14px #00d4ff20" : "none",
+              }}>
+              {cameraEnabled ? "● CAMERA ON" : "○ CAMERA OFF"}
             </button>
+
+            {/* Follow Butonu (Kameraya Bağımlı) */}
+            <button 
+              className="hs-btn" 
+              onClick={handleToggle} 
+              disabled={publishing || !isConnected || !cameraEnabled}
+              title={!cameraEnabled ? "Önce kamerayı açın" : ""}
+              style={{ 
+                padding: "0.38rem 0.85rem", borderRadius: "4px", 
+                background: humanFollowEnabled ? "#00ff8810" : "#ff444410", 
+                border: `1px solid ${humanFollowEnabled ? "#00ff8855" : "#ff444455"}`, 
+                color: humanFollowEnabled ? "#00ff88" : "#ff6666", 
+                cursor: (!isConnected || !cameraEnabled) ? "not-allowed" : "pointer", 
+                fontSize: "0.72rem", fontWeight: "700", letterSpacing: "0.08em", 
+                fontFamily: "'Barlow Condensed',sans-serif", 
+                opacity: (!isConnected || !cameraEnabled) ? 0.4 : 1, 
+                boxShadow: humanFollowEnabled ? "0 0 14px #00ff8820" : "none" 
+              }}>
+              {publishing ? "···" : humanFollowEnabled ? "▶ FOLLOW ON" : "⏹ FOLLOW OFF"}
+            </button>
+            
             <button className="hs-btn" onClick={() => setShowSettings(s => !s)}
               style={{ padding: "0.38rem 0.7rem", borderRadius: "4px", background: showSettings ? "#00d4ff10" : "transparent", border: `1px solid ${showSettings ? "#00d4ff44" : "#071830"}`, color: showSettings ? "#00d4ff" : "#1e4060", cursor: "pointer", fontSize: "0.72rem", fontWeight: "700", letterSpacing: "0.06em", fontFamily: "'Barlow Condensed',sans-serif" }}>
               ⚙ CONFIG
@@ -278,7 +322,7 @@ export default function HumanSnapshots() {
           </div>
         </header>
 
-        {/* ══════ BODY ════════════════════════════════════════════════ */}
+        {/* ────── BODY ──────────────────────────────────────────────── */}
         <div style={{ flex: 1, display: "flex", minHeight: 0, overflow: "hidden", position: "relative", zIndex: 1 }}>
 
           {/* Image + Log column */}
@@ -305,7 +349,7 @@ export default function HumanSnapshots() {
                 </>
               ) : (
                 <div style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:"0.5rem" }}>
-                  <div style={{ fontSize:"2rem", opacity:0.15 }}>📷</div>
+                  <div style={{ fontSize:"2rem", opacity:0.15 }}>🎥</div>
                   <div style={{ fontSize:"0.6rem", color:"#071830", letterSpacing:"0.14em", fontFamily:"'JetBrains Mono',monospace" }}>NO SIGNAL</div>
                 </div>
               )}
@@ -378,7 +422,7 @@ export default function HumanSnapshots() {
             </div>
           </div>
 
-          {/* ══════ SETTINGS DRAWER (overlay, backdrop close) ══════════ */}
+          {/* ────── SETTINGS DRAWER ────────────────────────────────────── */}
           {showSettings && (
             <div style={{ position:"absolute", inset:0, zIndex:50, display:"flex", justifyContent:"flex-end" }}>
               {/* Backdrop */}
@@ -387,7 +431,7 @@ export default function HumanSnapshots() {
               {/* Drawer panel */}
               <div className="hs-drawer" style={{ position:"relative", width:"320px", height:"100%", background:"#030b17", borderLeft:"1px solid #071830", display:"flex", flexDirection:"column", overflow:"hidden", zIndex:1 }}>
 
-                {/* Drawer header — CLOSE BUTTON ALWAYS HERE */}
+                {/* Drawer header */}
                 <div style={{ padding:"0.5rem 0.7rem", borderBottom:"1px solid #071830", flexShrink:0, display:"flex", alignItems:"center", justifyContent:"space-between", background:"#020810" }}>
                   <div style={{ display:"flex", alignItems:"center", gap:"0.5rem" }}>
                     <div style={{ width:"3px", height:"16px", background:"#00d4ff", borderRadius:"2px", boxShadow:"0 0 8px #00d4ff" }} />

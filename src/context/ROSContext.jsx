@@ -21,18 +21,9 @@ function saveUrl(url) {
   try { localStorage.setItem("rosbridge_url_v1", url); } catch {}
 }
 
-// ══════════════════════════════════════════════════════════════════════════
+// ──────────────────────────────────────────────────────────────────────────
 // SENKRONİZE EDİLEN TOPIC'LER
 // ──────────────────────────────────────────────────────────────────────────
-// Birden fazla tarayıcı/cihaz aynı rosbridge'e bağlandığında, bu topic'ler
-// üzerinden state senkronize olur. Her değişiklik latched publish edilir,
-// her client aynı topic'e subscribe olur → kendi publish'i + başka client'ların
-// publish'i hep aynı flow'dan state'e yansır. Böylece tüm cihazlar aynı anda
-// güncellenir.
-//
-// /ui/* topic'leri sadece UI client'ları arasındaki senkronizasyon içindir.
-// Robot tarafı bunları umursamaz.
-// ══════════════════════════════════════════════════════════════════════════
 const SYNC_TOPICS = {
   humanFollow: { name: "/human_follow/enable", type: "std_msgs/Bool"    },
   emergency:   { name: "/emergency/active",    type: "std_msgs/Bool"    },
@@ -54,12 +45,12 @@ export function ROSProvider({ children }) {
   const mountedRef = useRef(true);
   const connectingRef = useRef(false);
 
-  // ══════════════════════════════════════════════════════════════════════════
-  // PAYLAŞILAN STATE — Provider App seviyesinde mount'ludur, sayfa değişse bile
-  // ölmez. Tüm cihazlar bu state'leri ROS topic'leri üzerinden senkronize eder.
-  // ══════════════════════════════════════════════════════════════════════════
+  // ──────────────────────────────────────────────────────────────────────────
+  // PAYLAŞILAN STATE
+  // ──────────────────────────────────────────────────────────────────────────
   const [operationMode, setOperationModeState] = useState("manual");
   const [humanFollowEnabled, setHumanFollowEnabledState] = useState(false);
+  const [cameraEnabled, setCameraEnabled] = useState(false); // Yeni Kamera State
   const [estop, setEstopState] = useState(false);
   const [speedMode, setSpeedModeState] = useState(() => {
     const v = parseInt(localStorage.getItem("adaptive_velocity_mode") || "2", 10);
@@ -74,11 +65,9 @@ export function ROSProvider({ children }) {
     return isFinite(v) && v > 0 ? v : 1.2;
   });
 
-  // Publisher / Subscriber referansları
-  const pubsRef = useRef({}); // { key: ROSLIB.Topic }
-  const subsRef = useRef({}); // { key: ROSLIB.Topic }
+  const pubsRef = useRef({}); 
+  const subsRef = useRef({}); 
 
-  // ── Bir topic için latched publisher döner (yoksa advertise eder) ──────────
   const ensurePublisher = useCallback((key) => {
     const ros = rosRef.current;
     if (!ros) return null;
@@ -88,7 +77,7 @@ export function ROSProvider({ children }) {
       ros,
       name: cfg.name,
       messageType: cfg.type,
-      latch: true,   // rosbridge latched → geç bağlanan client son değeri alır
+      latch: true,
       queue_size: 1,
     });
     try { topic.advertise(); } catch {}
@@ -96,7 +85,6 @@ export function ROSProvider({ children }) {
     return topic;
   }, []);
 
-  // ── Sync publish helper ────────────────────────────────────────────────────
   const publishSync = useCallback((key, value) => {
     const p = ensurePublisher(key);
     if (!p) return;
@@ -104,20 +92,18 @@ export function ROSProvider({ children }) {
     catch (e) { console.warn(`[ROSContext] publish ${key} error:`, e); }
   }, [ensurePublisher]);
 
-  // ══════════════════════════════════════════════════════════════════════════
-  // SUBSCRIBE — Bağlantı kurulunca veya yenilenince tüm sync topic'lere abone ol
-  // ══════════════════════════════════════════════════════════════════════════
+  // ──────────────────────────────────────────────────────────────────────────
+  // SUBSCRIBE
+  // ──────────────────────────────────────────────────────────────────────────
   useEffect(() => {
     const ros = rosRef.current;
     if (!ros || !isConnected) return;
 
-    // Eski sub'ları ve pub'ları temizle (yeni ros instance için yeniden kur)
     Object.values(subsRef.current).forEach(s => { try { s.unsubscribe(); } catch {} });
     subsRef.current = {};
     Object.values(pubsRef.current).forEach(p => { try { p.unadvertise(); } catch {} });
     pubsRef.current = {};
 
-    // ── /mod subscribe (operationMode) ──────────────────────────────────────
     try {
       const modSub = new ROSLIB.Topic({
         ros, name: "/mod",
@@ -133,7 +119,6 @@ export function ROSProvider({ children }) {
       subsRef.current.mod = modSub;
     } catch (e) { console.warn("[ROSContext] /mod sub error:", e); }
 
-    // ── humanFollow subscribe ───────────────────────────────────────────────
     try {
       const hfSub = new ROSLIB.Topic({
         ros, name: SYNC_TOPICS.humanFollow.name,
@@ -146,7 +131,19 @@ export function ROSProvider({ children }) {
       subsRef.current.humanFollow = hfSub;
     } catch (e) { console.warn("[ROSContext] humanFollow sub error:", e); }
 
-    // ── estop subscribe ─────────────────────────────────────────────────────
+    // Yeni Kamera State Dinleyicisi
+    try {
+      const camSub = new ROSLIB.Topic({
+        ros, name: "/camera/state",
+        messageType: "std_msgs/msg/Bool",
+        queue_length: 1,
+      });
+      camSub.subscribe((msg) => {
+        setCameraEnabled(!!msg.data);
+      });
+      subsRef.current.cameraState = camSub;
+    } catch (e) { console.warn("[ROSContext] cameraState sub error:", e); }
+
     try {
       const esSub = new ROSLIB.Topic({
         ros, name: SYNC_TOPICS.emergency.name,
@@ -160,7 +157,6 @@ export function ROSProvider({ children }) {
       subsRef.current.estop = esSub;
     } catch (e) { console.warn("[ROSContext] estop sub error:", e); }
 
-    // ── speedMode subscribe ─────────────────────────────────────────────────
     try {
       const smSub = new ROSLIB.Topic({
         ros, name: SYNC_TOPICS.speedMode.name,
@@ -177,7 +173,6 @@ export function ROSProvider({ children }) {
       subsRef.current.speedMode = smSub;
     } catch (e) { console.warn("[ROSContext] speedMode sub error:", e); }
 
-    // ── linearMax / angularMax subscribe (UI-only senkron) ──────────────────
     try {
       const lmSub = new ROSLIB.Topic({
         ros, name: SYNC_TOPICS.linearMax.name,
@@ -213,20 +208,13 @@ export function ROSProvider({ children }) {
     return () => {
       Object.values(subsRef.current).forEach(s => { try { s.unsubscribe(); } catch {} });
       subsRef.current = {};
-      // pubsRef'leri burada kapatmıyoruz — aktif bir publish için tekrar advertise
-      // gerekebilir. Provider unmount'unda toplu temizlenir.
     };
   }, [rosInstance, isConnected]);
 
-  // ══════════════════════════════════════════════════════════════════════════
+  // ──────────────────────────────────────────────────────────────────────────
   // PUBLIC SETTER'LAR
   // ──────────────────────────────────────────────────────────────────────────
-  // Her setter optimistic update yapar (UI hemen tepki versin), sonra publish
-  // eder. Subscriber callback'i aynı değerle ikinci kez setState çağırsa bile
-  // React aynı değer için re-render yapmaz — zararsız.
-  // ══════════════════════════════════════════════════════════════════════════
 
-  // Nav2 goal iptal (mod manuele döndüğünde)
   const cancelNav2Goal = useCallback((ros) => {
     if (!ros) return;
     try {
@@ -268,7 +256,6 @@ export function ROSProvider({ children }) {
         });
         modTopic.advertise();
         modTopic.publish({ data: newMode });
-        // Not: burayı unadvertise etmiyoruz ki latched değer kaybolmasın
         setTimeout(() => { try { modTopic.unadvertise(); } catch {} }, 800);
       } catch {}
 
@@ -286,6 +273,36 @@ export function ROSProvider({ children }) {
     console.log(`[ROSContext] human_follow/enable → ${next}`);
     return next;
   }, [humanFollowEnabled, isConnected, publishSync]);
+
+  // Yeni Kamera Toggle Fonksiyonu
+  const toggleCamera = useCallback(() => {
+    const ros = rosRef.current;
+    const next = !cameraEnabled;
+    setCameraEnabled(next);
+    
+    if (ros && isConnected) {
+      try {
+        const t = new ROSLIB.Topic({
+          ros, name: "/camera/enable",
+          messageType: "std_msgs/Bool", queue_size: 1,
+        });
+        t.publish({ data: next });
+        setTimeout(() => { try { t.unadvertise(); } catch {} }, 500);
+        
+        // Kamera kapatılırken follow da kapansın (UI tarafında da güvence)
+        if (!next && humanFollowEnabled) {
+          const f = new ROSLIB.Topic({
+            ros, name: "/human_follow/enable",
+            messageType: "std_msgs/Bool", queue_size: 1,
+          });
+          f.publish({ data: false });
+          setHumanFollowEnabledState(false);
+          setTimeout(() => { try { f.unadvertise(); } catch {} }, 500);
+        }
+      } catch (e) { console.warn("[ROSContext] toggleCamera error:", e); }
+    }
+    return next;
+  }, [cameraEnabled, humanFollowEnabled, isConnected]);
 
   const setEstop = useCallback((active) => {
     const v = !!active;
@@ -317,9 +334,9 @@ export function ROSProvider({ children }) {
     if (isConnected) publishSync("angularMax", num);
   }, [isConnected, publishSync]);
 
-  // ══════════════════════════════════════════════════════════════════════════
+  // ──────────────────────────────────────────────────────────────────────────
   // BAĞLANTI YÖNETİMİ
-  // ══════════════════════════════════════════════════════════════════════════
+  // ──────────────────────────────────────────────────────────────────────────
   useEffect(() => { saveUrl(rosbridgeUrl); }, [rosbridgeUrl]);
 
   const connect = useCallback((url) => {
@@ -340,7 +357,7 @@ export function ROSProvider({ children }) {
 
     ros.on("connection", () => {
       if (!mountedRef.current) return;
-      console.log("[ROSContext] ✅ Bağlandı!");
+      console.log("[ROSContext] 🟢 Bağlandı!");
       connectingRef.current = false;
       rosRef.current = ros;
       setRosInstance(ros);
@@ -356,7 +373,7 @@ export function ROSProvider({ children }) {
       rosRef.current = null;
       setRosInstance((prev) => prev ? null : prev);
       setIsConnected((prev) => {
-        if (prev) { console.log("[ROSContext] 🔌 Bağlantı koptu"); setStatus("Bağlantı koptu"); }
+        if (prev) { console.log("[ROSContext] 🔴 Bağlantı koptu"); setStatus("Bağlantı koptu"); }
         return false;
       });
       if (!reconnectTimer.current) {
@@ -392,7 +409,6 @@ export function ROSProvider({ children }) {
       console.log("[ROSContext] Provider unmount");
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
 
-      // Tüm publisher/subscriber'ları temizle
       Object.values(pubsRef.current).forEach(p => { try { p.unadvertise(); } catch {} });
       pubsRef.current = {};
       Object.values(subsRef.current).forEach(s => { try { s.unsubscribe(); } catch {} });
@@ -426,12 +442,14 @@ export function ROSProvider({ children }) {
     setRosbridgeUrl,
     reconnect,
 
-    // ── Cihazlar ve sayfalar arasında senkronize paylaşılan state ──
     operationMode,
     setOperationMode,
 
     humanFollowEnabled,
     toggleHumanFollow,
+
+    cameraEnabled,
+    toggleCamera,
 
     estop,
     setEstop,
