@@ -77,6 +77,7 @@ function Field({label,value,onChange}){
   return <div style={{flex:1,minWidth:200}}><div style={{fontSize:"0.5rem",color:TEXT3,letterSpacing:"0.1em",marginBottom:4}}>{label}</div><input value={value} onChange={e=>onChange(e.target.value)} style={{width:"100%",background:"#03070e",border:`1px solid ${BORDER}`,borderRadius:4,color:TEXT,padding:"0.35rem 0.5rem",fontSize:"0.68rem",fontFamily:MONO,outline:"none",boxSizing:"border-box"}}/></div>;
 }
 
+
 export default function MapPage(){
   const{ros,isConnected}=useROS();
   const[mapInfo,setMapInfo]=useState(null);
@@ -357,7 +358,7 @@ export default function MapPage(){
   const cursor=isPanning?"grabbing":navGoalMode?"crosshair":initPoseMode?"cell":"default";
 
   return (
-    <div style={{height:"calc(100vh - 56px)",display:"flex",flexDirection:"column",background:BG,color:TEXT,fontFamily:MONO,padding:"0.5rem",gap:"0.4rem",boxSizing:"border-box",overflow:"hidden"}}>
+    <div className="page-root" style={{height:"calc(100vh - 56px)",display:"flex",flexDirection:"column",background:BG,color:TEXT,fontFamily:MONO,padding:"0.5rem",gap:"0.4rem",boxSizing:"border-box",overflow:"hidden"}}>
 
       {/* ÜST BAR */}
       <div style={{flexShrink:0,display:"flex",alignItems:"center",gap:"0.5rem",flexWrap:"wrap"}}>
@@ -404,7 +405,7 @@ export default function MapPage(){
         </div>
 
         {/* Viewport */}
-        <div ref={viewportRef} style={{flex:1,overflow:"hidden",borderRadius:5,border:`1px solid ${BORDER2}`,background:"#020609",position:"relative",minHeight:0,cursor}}>
+        <div ref={viewportRef} className="vp-fill" style={{flex:1,overflow:"hidden",borderRadius:5,border:`1px solid ${BORDER2}`,background:"#020609",position:"relative",minHeight:0,cursor}}>
           {mapReady
             ?<canvas ref={canvasRef} style={{width:"100%",height:"100%",display:"block"}} onMouseDown={onMouseDown} onMouseMove={onMouseMove} onMouseUp={onMouseUp} onMouseLeave={onMouseLeave} onContextMenu={onContextMenu}/>
             :<div style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:"0.5rem"}}>

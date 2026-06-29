@@ -531,7 +531,7 @@ export default function HealthPage() {
   const worstLevel = LEVEL[worst] || LEVEL[0];
 
   return (
-    <div style={{
+    <div className="page-root" style={{
       minHeight: "calc(100vh - 56px)",
       background: BG,
       backgroundImage: "radial-gradient(rgba(14,165,233,0.06) 1px, transparent 1px)",

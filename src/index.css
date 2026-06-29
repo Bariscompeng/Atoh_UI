@@ -3,14 +3,28 @@
   line-height: 1.5;
   font-weight: 400;
 
-  color-scheme: light dark;
+  color-scheme: dark;
   color: rgba(255, 255, 255, 0.87);
-  background-color: #242424;
+  background-color: #04090f;
 
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+
+  /* Height of the top navigation bar. Pages assume this when they use
+     calc(100vh - 56px); keep them in sync. */
+  --nav-h: 56px;
+  /* Notch / home-indicator safe areas (0 on devices without them). */
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+}
+
+* {
+  /* Stop fixed-width inline layouts from forcing a horizontal scrollbar. */
+  min-width: 0;
 }
 
 a {
@@ -22,11 +36,16 @@ a:hover {
   color: #535bf2;
 }
 
+html,
 body {
   margin: 0;
   width: 100%;
+  overflow-x: hidden;
+  overscroll-behavior-y: none;
+}
+body {
   height: 100vh;
-  min-width: 320px;
+  height: 100dvh; /* respects mobile browser chrome */
 }
 
 #root {
@@ -34,6 +53,179 @@ body {
   height: 100%;
   display: flex;
   flex-direction: column;
+}
+
+/* ── App layout ──────────────────────────────────────────── */
+.app-container {
+  height: 100vh;
+  height: 100dvh;
+  padding-top: var(--safe-top);
+  padding-left: var(--safe-left);
+  padding-right: var(--safe-right);
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation; /* kill the 300ms tap delay / double-tap zoom */
+}
+
+/* Scrollable host for routed pages: any page taller than the viewport
+   scrolls here instead of being clipped. */
+.page-host {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+  padding-bottom: var(--safe-bottom);
+}
+.page-host > * {
+  width: 100%;
+  max-width: 100%;
+}
+
+/* Thin custom scrollbars (desktop) */
+.page-host::-webkit-scrollbar,
+.nav-bar::-webkit-scrollbar {
+  height: 6px;
+  width: 8px;
+}
+.page-host::-webkit-scrollbar-thumb,
+.nav-bar::-webkit-scrollbar-thumb {
+  background: #1e3a52;
+  border-radius: 8px;
+}
+
+/* ── Top navigation ──────────────────────────────────────── */
+.nav-bar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  height: var(--nav-h);
+  padding: 0 12px;
+  box-sizing: border-box;
+  border-bottom: 1px solid #0f2236;
+  background: #07111d;
+  overflow-x: auto;
+  overflow-y: hidden;
+  white-space: nowrap;
+  flex-shrink: 0;
+  scrollbar-width: thin;
+}
+.nav-bar::-webkit-scrollbar {
+  height: 0; /* hide horizontal scrollbar on the nav, keep swipe scroll */
+}
+.nav-link {
+  flex: 0 0 auto;
+  padding: 7px 12px;
+  border-radius: 10px;
+  text-decoration: none;
+  color: #c8dde8;
+  background: transparent;
+  border: 1px solid #162d46;
+  font-size: 0.8rem;
+  line-height: 1;
+  transition: background 0.15s, border-color 0.15s;
+}
+.nav-link:hover {
+  border-color: #0ea5e9;
+}
+.nav-link.active {
+  background: rgba(14, 165, 233, 0.14);
+  border-color: #0ea5e9;
+  color: #0ea5e9;
+}
+
+/* ── Mobile: make dense desktop pages reachable & fit width ── */
+@media (max-width: 820px) {
+  /* Page roots are sized to the viewport with overflow:hidden on desktop,
+     which clips content on a phone. Let them grow and scroll via .page-host. */
+  .page-root {
+    height: auto !important;
+    min-height: calc(100dvh - var(--nav-h)) !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    overflow: visible !important;
+  }
+  /* Inner viewport-height wrappers: release the fixed height too. */
+  .page-inner {
+    height: auto !important;
+    min-height: 0 !important;
+  }
+  /* Flex/aspect-fill viewports (maps, canvas, video, joystick) would collapse
+     to ~0 once their parent height is auto — give them a real height. */
+  .vp-fill {
+    min-height: 60vh !important;
+    aspect-ratio: auto !important;
+  }
+  /* Multi-column layouts → single column. */
+  .grid-collapse {
+    grid-template-columns: 1fr !important;
+  }
+  /* Horizontal flex split → stacked column. */
+  .stack-mobile {
+    flex-direction: column !important;
+  }
+  .stack-mobile > * {
+    flex: 0 0 auto !important;
+    width: 100% !important;
+    max-width: 100% !important;
+  }
+
+  /* GPS mission planner: its resizable 2×2 grid (map / table / action panel)
+     is desktop-only. Stack everything into one scrollable column. */
+  .gmp-layout {
+    display: flex !important;
+    flex-direction: column !important;
+    height: auto !important;
+    min-height: calc(100dvh - var(--nav-h)) !important;
+    overflow: visible !important;
+  }
+  .gmp-layout > * {
+    grid-column: auto !important;
+    grid-row: auto !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    flex: 0 0 auto !important;
+    height: auto !important;
+  }
+  /* Map cell becomes a column: real-height map on top, the HUD overlays
+     (which float over the map on desktop) flow as stacked blocks below it. */
+  .gmp-map-cell {
+    display: flex !important;
+    flex-direction: column !important;
+    min-height: 0 !important;
+  }
+  .gmp-map-cell > div:first-child {
+    height: 52vh !important;
+    flex: 0 0 auto !important;
+  }
+  .gmp-frame-debug-panel,
+  .gmp-heading-calibration,
+  .gmp-map-messages,
+  .gmp-derived-toggles,
+  .gmp-map-actions {
+    position: static !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
+    margin: 6px 0 0 !important;
+    box-sizing: border-box !important;
+  }
+  .gmp-map-actions {
+    flex-wrap: wrap !important;
+  }
+  .gmp-map-actions .gmp-mp-btn,
+  .gmp-derived-toggles .gmp-derived-toggle {
+    flex: 1 1 auto !important;
+  }
+
+  /* Human tracking: dense header must wrap instead of overlapping. */
+  .hs-header {
+    flex-wrap: wrap !important;
+    gap: 0.4rem !important;
+  }
+  .hs-header > * {
+    margin-left: 0 !important;
+  }
 }
 
 h1 {
@@ -60,15 +252,5 @@ button:focus-visible {
   outline: 4px auto -webkit-focus-ring-color;
 }
 
-@media (prefers-color-scheme: light) {
-  :root {
-    color: #213547;
-    background-color: #ffffff;
-  }
-  a:hover {
-    color: #747bff;
-  }
-  button {
-    background-color: #f9f9f9;
-  }
-}
+/* The teleop UI is a dark control surface; pages set their own colors.
+   No light-mode override so we don't get white flashes on light devices. */

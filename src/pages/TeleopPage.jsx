@@ -253,15 +253,15 @@ export default function TeleopPage() {
   ];
 
   return (
-    <div style={{
-      minHeight: "calc(100vh - 56px)", width: "100vw",
+    <div className="page-root" style={{
+      minHeight: "calc(100vh - 56px)", width: "100%",
       background: BG,
       backgroundImage: "radial-gradient(rgba(14,165,233,0.06) 1px, transparent 1px)",
       backgroundSize: "24px 24px",
       color: TEXT, padding: "0.65rem",
       fontFamily: MONO, overflow: "hidden", boxSizing: "border-box",
     }}>
-      <div style={{ maxWidth: 1400, margin: "0 auto", height: "calc(100vh - 80px)", display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+      <div className="page-inner" style={{ maxWidth: 1400, margin: "0 auto", height: "calc(100vh - 80px)", display: "flex", flexDirection: "column", gap: "0.5rem" }}>
 
         {/* ── HEADER ── */}
         <div style={{ flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "space-between" }}>

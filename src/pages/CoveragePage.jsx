@@ -622,8 +622,9 @@ export default function CoveragePage() {
   const publishManualPath = useCallback(async () => {
     if (!ros || !isConnected) { setPageError("ROS bağlı değil"); return; }
     if (manualPoints.length < 2) { setPageError("En az 2 nokta gerekli"); return; }
-    // Manuel path her zaman follow_path ile takip edilir (hızlı + pürüzsüz)
-    await setRosParam("coverage_executor_node", "execution_mode", "follow_path").catch(() => {});
+    // Manuel path: NavigateThroughPoses ? ak?c? geçi? + engel etraf?ndan yeniden planlama
+    await setRosParam("manual_path_node", "point_spacing", 1.5).catch(() => {});
+    await setRosParam("coverage_executor_node", "execution_mode", "navigate_through_poses").catch(() => {});
     const t = new ROSLIB.Topic({ ros, name: "/coverage/manual_points", messageType: "geometry_msgs/msg/PoseArray", queue_size: 1 });
     t.publish({
       header: { frame_id: "map", stamp: { sec: Math.floor(Date.now() / 1000), nanosec: 0 } },
@@ -702,7 +703,7 @@ export default function CoveragePage() {
   const startCoverage = useCallback(async () => {
     if (!ros || !isConnected) { setPageError("ROS bağlı değil"); return; }
     setPageError("");
-    const mode = activeMode === MODE_MANUAL ? "follow_path" : execMode;
+   const mode = activeMode === MODE_MANUAL ? "navigate_through_poses" : execMode; 
     await setRosParam("coverage_executor_node", "execution_mode", mode).catch(() => {});
     if (executorAvailable) {
       try {
@@ -784,8 +785,8 @@ export default function CoveragePage() {
         </div>
       )}
 
-    <div style={{ minHeight: "calc(100vh - 56px)", width: "100vw", background: "#060d1a", color: "white", padding: "0.5rem", fontFamily: "'JetBrains Mono','Fira Code',monospace", overflow: "hidden", boxSizing: "border-box" }}>
-      <div style={{ maxWidth: "1600px", margin: "0 auto", height: "calc(100vh - 68px)", display: "flex", flexDirection: "column", gap: "0.4rem" }}>
+    <div className="page-root" style={{ minHeight: "calc(100vh - 56px)", width: "100%", background: "#060d1a", color: "white", padding: "0.5rem", fontFamily: "'JetBrains Mono','Fira Code',monospace", overflow: "hidden", boxSizing: "border-box" }}>
+      <div className="page-inner" style={{ maxWidth: "1600px", margin: "0 auto", height: "calc(100vh - 68px)", display: "flex", flexDirection: "column", gap: "0.4rem" }}>
 
         {/* HEADER */}
         <div style={{ flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
@@ -828,7 +829,7 @@ export default function CoveragePage() {
         )}
 
         {/* MAIN */}
-        <div style={{ flex: 1, display: "grid", gridTemplateColumns: "260px 1fr", gap: "0.4rem", minHeight: 0 }}>
+        <div className="grid-collapse" style={{ flex: 1, display: "grid", gridTemplateColumns: "260px 1fr", gap: "0.4rem", minHeight: 0 }}>
 
           {/* LEFT PANEL */}
           <div style={{ background: "#0d1829", borderRadius: "0.4rem", padding: "0.75rem", border: "1px solid #162032", display: "flex", flexDirection: "column", gap: "0.5rem", overflow: "auto" }}>
@@ -1077,7 +1078,7 @@ export default function CoveragePage() {
                 <span style={{ color: "#ef4444" }}>● End</span>
               </div>
             </div>
-            <div ref={containerRef} style={{ flex: 1, background: "#040810", borderRadius: "0.3rem", border: "1px solid #162032", overflow: "hidden", position: "relative", display: "flex", alignItems: "center", justifyContent: "center", minHeight: 0 }}>
+            <div ref={containerRef} className="vp-fill" style={{ flex: 1, background: "#040810", borderRadius: "0.3rem", border: "1px solid #162032", overflow: "hidden", position: "relative", display: "flex", alignItems: "center", justifyContent: "center", minHeight: 0 }}>
               {mapImageData
                 ? <canvas ref={canvasRef} onMouseDown={onMouseDown} onMouseMove={onMouseMove} onMouseUp={onMouseUp} onMouseLeave={() => { if (goalEnabled || precisionEnabled || offsetEnabled) { goalDragRef.current = null; setGoalDragEnd(null); } }} style={{ cursor: canvasCursor, display: "block", maxWidth: "100%", maxHeight: "100%" }} />
                 : <div style={{ textAlign: "center" }}>

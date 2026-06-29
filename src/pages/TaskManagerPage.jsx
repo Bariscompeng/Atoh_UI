@@ -1,6 +1,16 @@
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import { useROS } from "../context/ROSContext";
 import * as ROSLIB from "roslib";
+import { useNavigate } from "react-router-dom";
+import SavedGpsRouteCard from "../features/gpsMission/routes/SavedGpsRouteCard";
+import {
+  createGpsRoutePreviewImage,
+  deleteSavedGpsMissionRoute,
+  gpsMissionRoutesChangedEventName,
+  queueGpsMissionDraftRouteOpen,
+  queueGpsMissionRouteOpen,
+  readSavedGpsMissionRoutes
+} from "../utils/gpsMissionRoutes";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 const rad2deg = (r) => ((r * 180) / Math.PI).toFixed(1);
@@ -9,6 +19,14 @@ const quatToYaw = (q) =>
 const yawToQuat = (yaw) => ({ x: 0, y: 0, z: Math.sin(yaw / 2), w: Math.cos(yaw / 2) });
 const prettyErr = (e) => (e?.message || String(e)).slice(0, 120);
 const ts = () => ({ sec: Math.floor(Date.now() / 1000), nanosec: (Date.now() % 1000) * 1e6 });
+const waypointSpeedValue = (value) => {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.min(3.0, n) : 1.0;
+};
+const waypointWaitSecondsValue = (value) => {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.min(3600, Math.max(1, Math.round(n))) : undefined;
+};
 
 // ── Mode definitions ─────────────────────────────────────────────────────────
 const MODE_LABELS = {
@@ -39,27 +57,110 @@ const btnS = (bg, border) => ({ padding: "0.45rem 0.75rem", background: bg || "#
 const pillS = (active, color) => ({ padding: "0.5rem 0.8rem", background: active ? `${color}18` : "#0a1020", border: `2px solid ${active ? color : "#1e293b"}`, borderRadius: "0.5rem", color: active ? color : "#475569", cursor: "pointer", fontSize: "0.7rem", fontWeight: active ? "800" : "600", fontFamily: "inherit", transition: "all 0.25s", display: "flex", alignItems: "center", gap: "0.4rem", flex: 1, justifyContent: "center" });
 const inputS = { width: "100%", padding: "0.4rem", background: "#0a1020", border: "1px solid #1e3a5f", borderRadius: "0.25rem", color: "#e2e8f0", fontSize: "0.75rem", fontFamily: "inherit", outline: "none", boxSizing: "border-box" };
 
+// ── Sabit konum GPS varsayılanları ───────────────────────────────────────────
+const LEGACY_HOME_GPS   = { lat: 39.8935863, lon: 32.7717426, yaw: -16.3 };
+const LEGACY_CHARGE_GPS = { lat: 39.8936533, lon: 32.7716855, yaw: -214.8 };
+const DEFAULT_HOME_GPS   = { lat: 39.7961831, lon: 32.5312344, yaw: -16.3 };
+const DEFAULT_CHARGE_GPS = { lat: 39.7962284, lon: 32.5313263, yaw: -214.8 };
+const BED_LOCATIONS = [
+  { id: "bed-1", name: "Yatak-1", mode: "gps", lat: 39.7961957, lon: 32.5312284 },
+  { id: "bed-2", name: "Yatak-2", mode: "gps", lat: 39.7962241, lon: 32.5312753 },
+  { id: "bed-3", name: "Yatak-3", mode: "gps", lat: 39.7962403, lon: 32.5312984 },
+  { id: "bed-4", name: "Yatak-4", mode: "gps", lat: 39.7962575, lon: 32.5313236 },
+  { id: "bed-5", name: "Yatak-5", mode: "gps", lat: 39.7962722, lon: 32.5313474 },
+  { id: "bed-6", name: "Yatak-6", mode: "gps", lat: 39.7962872, lon: 32.5313725 },
+  { id: "bed-7", name: "Yatak-7", mode: "gps", lat: 39.7963031, lon: 32.5313953 },
+];
+const BED_PREVIEW_IMAGES = Object.fromEntries(
+  BED_LOCATIONS.map(loc => [loc.id, `/bed-previews/${loc.name.toLowerCase()}.png`])
+);
+const closeGps = (a, b) =>
+  Math.abs(Number(a?.lat) - b.lat) < 0.000001 &&
+  Math.abs(Number(a?.lon) - b.lon) < 0.000001;
+const loadGps = (key, def, legacy) => {
+  try {
+    const stored = JSON.parse(localStorage.getItem(key) || "{}");
+    if (!stored || closeGps(stored, legacy)) {
+      localStorage.setItem(key, JSON.stringify(def));
+      return def;
+    }
+    return { ...def, ...stored };
+  } catch {
+    return def;
+  }
+};
+const TASK_UI_STORAGE_KEY = "atoh2_task_manager_ui_state_v1";
+const TASK_LOG_STORAGE_KEY = "atoh2_task_manager_logs_v1";
+const READY_TASK_QUEUE_STORAGE_KEY = "atoh2_ready_task_queue_v1";
+const loadJson = (key, fallback) => { try { return JSON.parse(localStorage.getItem(key) || "null") ?? fallback; } catch { return fallback; } };
+const saveJson = (key, value) => { try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* best-effort local cache */ } };
+const hasText = (value) => String(value ?? "").trim() !== "";
+const optionalNumber = (value) => {
+  if (!hasText(value)) return null;
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+};
+const normalizeReadyTaskQueue = (rawQueue) => (
+  Array.isArray(rawQueue)
+    ? rawQueue
+        .map((item, index) => {
+          const lat = Number(item?.lat);
+          const lon = Number(item?.lon);
+          if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+          return {
+            id: String(item?.id || `ready-task-${Date.now()}-${index}`),
+            name: String(item?.name || `Hazır Görev ${index + 1}`),
+            lat,
+            lon,
+            sourceId: String(item?.sourceId || ""),
+          };
+        })
+        .filter(Boolean)
+    : []
+);
+
 // ═════════════════════════════════════════════════════════════════════════════
 export default function TaskManagerPage() {
   const { ros, isConnected, reconnect, operationMode, setOperationMode } = useROS();
+  const navigate = useNavigate();
+  const [initialUi] = useState(() => loadJson(TASK_UI_STORAGE_KEY, {}));
 
   // ── State ──────────────────────────────────────────────────────────────────
   const [recoveryActive, setRecoveryActive] = useState(false);
-  const [recoveryRaw, setRecoveryRaw] = useState(null);
   const [robotPose, setRobotPose] = useState(null);
   const [poseSource, setPoseSource] = useState("");
   const [goalPose, setGoalPose] = useState(null);
-  const [goalX, setGoalX] = useState("");
-  const [goalY, setGoalY] = useState("");
-  const [goalYaw, setGoalYaw] = useState("0");
+  const [goalX, setGoalX] = useState(initialUi.goalX || "");
+  const [goalY, setGoalY] = useState(initialUi.goalY || "");
+  const [goalYaw, setGoalYaw] = useState(initialUi.goalYaw || "0");
   const [taskState, setTaskState] = useState({ name: "", state: "IDLE", observers: [] });
   const [taskRegistry, setTaskRegistry] = useState({ packs: [], tasks: [], observers: [] });
-  const [logs, setLogs] = useState([]);
+  const [logs, setLogs] = useState(() => loadJson(TASK_LOG_STORAGE_KEY, []));
   const logEndRef = useRef(null);
   const [coverageStatus, setCoverageStatus] = useState(null);
-  const [customCmd, setCustomCmd] = useState("");
-  const [taskDistance, setTaskDistance] = useState("100");
+  const [customCmd, setCustomCmd] = useState(initialUi.customCmd || "");
+  const [taskDistance, setTaskDistance] = useState(initialUi.taskDistance || "100");
   const [muxActiveSource, setMuxActiveSource] = useState("(none)");
+  const [activeTab, setActiveTab] = useState(initialUi.activeTab || "genel"); // "genel" | "gps"
+  const [selectedPreview, setSelectedPreview] = useState(null);
+  const [readyTaskQueue, setReadyTaskQueue] = useState(() => normalizeReadyTaskQueue(loadJson(READY_TASK_QUEUE_STORAGE_KEY, [])));
+  const [customLocations, setCustomLocations] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("atoh2_custom_locations") || "[]"); } catch { return []; }
+  });
+  const [savedRoutes, setSavedRoutes] = useState(() => readSavedGpsMissionRoutes());
+  const [newLocName, setNewLocName] = useState(initialUi.newLocName || "");
+  const [newLocMode, setNewLocMode] = useState(initialUi.newLocMode || "xy"); // "xy" | "gps"
+  const [newLocX, setNewLocX] = useState(initialUi.newLocX || "");
+  const [newLocY, setNewLocY] = useState(initialUi.newLocY || "");
+  const [newLocLat, setNewLocLat] = useState(initialUi.newLocLat || "");
+  const [newLocLon, setNewLocLon] = useState(initialUi.newLocLon || "");
+  const [newLocYaw, setNewLocYaw] = useState(initialUi.newLocYaw || "0");
+  const [activeTaskLabel, setActiveTaskLabel] = useState(initialUi.activeTaskLabel || "");
+  // Eve Dön / Şarja Git GPS hedefleri — düzenlenebilir, localStorage'da kalıcı
+  const [homeGps, setHomeGps] = useState(() => loadGps("atoh2_home_gps", DEFAULT_HOME_GPS, LEGACY_HOME_GPS));
+  const [chargeGps, setChargeGps] = useState(() => loadGps("atoh2_charge_gps", DEFAULT_CHARGE_GPS, LEGACY_CHARGE_GPS));
+  const [editHome, setEditHome] = useState(!!initialUi.editHome);
+  const [editCharge, setEditCharge] = useState(!!initialUi.editCharge);
 
   // Refs
   const recoverySubRef = useRef(null);
@@ -72,9 +173,16 @@ export default function TaskManagerPage() {
   const registrySubRef = useRef(null);
   const goalSubRef = useRef(null);
   const goalTaskSubRef = useRef(null);
+  const gpsGoalSubRef = useRef(null);
+  const gpsStatusSubRef = useRef(null);
   const coverageSubRef = useRef(null);
   const muxLogSubRef = useRef(null);
   const autoListDone = useRef(false);
+  const pendingCommandRef = useRef(null);
+  const lastStateLogRef = useRef("");
+  const lastGoalLogRef = useRef("");
+  const gpsWaypointPubRef = useRef(null);
+  const directGpsTaskRef = useRef(false);
 
   // ── Log helper ─────────────────────────────────────────────────────────────
   const addLog = useCallback((type, msg) => {
@@ -82,6 +190,67 @@ export default function TaskManagerPage() {
     setLogs((prev) => [...prev.slice(-80), { id: Date.now() + Math.random(), time, type, msg }]);
   }, []);
   useEffect(() => { logEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [logs]);
+  useEffect(() => { saveJson(TASK_LOG_STORAGE_KEY, logs.slice(-80)); }, [logs]);
+  useEffect(() => { saveJson(READY_TASK_QUEUE_STORAGE_KEY, readyTaskQueue); }, [readyTaskQueue]);
+
+  useEffect(() => {
+    saveJson(TASK_UI_STORAGE_KEY, {
+      activeTab,
+      goalX,
+      goalY,
+      goalYaw,
+      customCmd,
+      taskDistance,
+      newLocName,
+      newLocMode,
+      newLocX,
+      newLocY,
+      newLocLat,
+      newLocLon,
+      newLocYaw,
+      activeTaskLabel,
+      editHome,
+      editCharge,
+    });
+  }, [
+    activeTab,
+    goalX,
+    goalY,
+    goalYaw,
+    customCmd,
+    taskDistance,
+    newLocName,
+    newLocMode,
+    newLocX,
+    newLocY,
+    newLocLat,
+    newLocLon,
+    newLocYaw,
+    activeTaskLabel,
+    editHome,
+    editCharge,
+  ]);
+
+  // ── Özel GPS görevleri → localStorage'a kalıcı kayıt ─────────────────────────
+  useEffect(() => {
+    try { localStorage.setItem("atoh2_custom_locations", JSON.stringify(customLocations)); } catch {}
+  }, [customLocations]);
+
+  useEffect(() => {
+    const syncSavedRoutes = () => setSavedRoutes(readSavedGpsMissionRoutes());
+    syncSavedRoutes();
+    window.addEventListener(gpsMissionRoutesChangedEventName(), syncSavedRoutes);
+    return () => window.removeEventListener(gpsMissionRoutesChangedEventName(), syncSavedRoutes);
+  }, []);
+
+  // ── Eve Dön / Şarja Git GPS hedefleri → localStorage'a kalıcı kayıt ──────────
+  useEffect(() => { try { localStorage.setItem("atoh2_home_gps", JSON.stringify(homeGps)); } catch {} }, [homeGps]);
+  useEffect(() => { try { localStorage.setItem("atoh2_charge_gps", JSON.stringify(chargeGps)); } catch {} }, [chargeGps]);
+  useEffect(() => {
+    return () => {
+      try { gpsWaypointPubRef.current?.unadvertise(); } catch {}
+    };
+  }, []);
 
   // ══════════════════════════════════════════════════════════════════════════
   // AUTO-LIST: Bağlantı kurulduğunda registry'yi otomatik al
@@ -118,7 +287,7 @@ export default function TaskManagerPage() {
         let val = msg.data !== undefined
           ? (typeof msg.data === "boolean" ? (msg.data ? 1 : 0) : typeof msg.data === "string" ? parseInt(msg.data, 10) : Number(msg.data))
           : null;
-        if (val !== null && !isNaN(val)) { setRecoveryRaw(val); setRecoveryActive(val === 1); }
+        if (val !== null && !isNaN(val)) { setRecoveryActive(val === 1); }
       });
       recoverySubRef.current = topic;
     };
@@ -126,11 +295,10 @@ export default function TaskManagerPage() {
     return () => { if (recoverySubRef.current) { try { recoverySubRef.current.unsubscribe(); } catch {} } };
   }, [ros, isConnected]);
 
-  // ── Robot Pose (TF chain + AMCL + odom fallback) ──────────────────────────
+  // ── Robot Pose (yalnızca TF chain) ─────────────────────────────────────────
   useEffect(() => {
     if (!ros || !isConnected) return;
     [amclSubRef, tfSubRef, odomSubRef].forEach(r => { if (r.current) { try { r.current.unsubscribe(); } catch {} } });
-    let lastAmclTime = 0, lastTfTime = 0;
     tfCache.current = { mapToOdom: null, odomToBase: null };
 
     const chainTF = () => {
@@ -140,12 +308,10 @@ export default function TaskManagerPage() {
       const x = mapToOdom.x + odomToBase.x * c1 - odomToBase.y * s1;
       const y = mapToOdom.y + odomToBase.x * s1 + odomToBase.y * c1;
       const yaw = mapToOdom.yaw + odomToBase.yaw;
-      lastTfTime = Date.now();
-      if (Date.now() - lastAmclTime < 2000) return;
       setRobotPose({ x, y, yaw }); setPoseSource("TF");
     };
 
-    const tf = new ROSLIB.Topic({ ros, name: "/tf", messageType: "tf2_msgs/msg/TFMessage", throttle_rate: 500, queue_length: 1, compression: "cbor" });
+    const tf = new ROSLIB.Topic({ ros, name: "/tf", messageType: "tf2_msgs/msg/TFMessage", throttle_rate: 500, queue_length: 1 });
     tf.subscribe((msg) => {
       if (!msg.transforms) return;
       for (const t of msg.transforms) {
@@ -160,14 +326,7 @@ export default function TaskManagerPage() {
     });
     tfSubRef.current = tf;
 
-    const amcl = new ROSLIB.Topic({ ros, name: "/amcl_pose", messageType: "geometry_msgs/msg/PoseWithCovarianceStamped", throttle_rate: 200, queue_length: 1, compression: "cbor" });
-    amcl.subscribe((msg) => { lastAmclTime = Date.now(); const p = msg.pose.pose; setRobotPose({ x: p.position.x, y: p.position.y, yaw: quatToYaw(p.orientation) }); setPoseSource("AMCL"); });
-    amclSubRef.current = amcl;
-
-    const odom = new ROSLIB.Topic({ ros, name: "/odom", messageType: "nav_msgs/msg/Odometry", throttle_rate: 200, queue_length: 1, compression: "cbor" });
-    odom.subscribe((msg) => { if (Date.now() - lastAmclTime < 2000 || Date.now() - lastTfTime < 2000) return; const p = msg.pose.pose; setRobotPose({ x: p.position.x, y: p.position.y, yaw: quatToYaw(p.orientation) }); setPoseSource("ODOM"); });
-    odomSubRef.current = odom;
-    return () => { [amcl, tf, odom].forEach(t => { try { t.unsubscribe(); } catch {} }); };
+    return () => { try { tf.unsubscribe(); } catch {} };
   }, [ros, isConnected]);
 
   // ── /goal_pose (Nav2 doğrudan) ─────────────────────────────────────────────
@@ -175,18 +334,71 @@ export default function TaskManagerPage() {
     if (!ros || !isConnected) return;
     if (goalSubRef.current) { try { goalSubRef.current.unsubscribe(); } catch {} }
     const topic = new ROSLIB.Topic({ ros, name: "/goal_pose", messageType: "geometry_msgs/msg/PoseStamped", throttle_rate: 200, queue_length: 1 });
-    topic.subscribe((msg) => { const p = msg.pose; setGoalPose({ x: p.position.x, y: p.position.y, yaw: quatToYaw(p.orientation) }); });
+    topic.subscribe((msg) => {
+      const p = msg.pose;
+      const nextGoal = { x: p.position.x, y: p.position.y, yaw: quatToYaw(p.orientation) };
+      const goalKey = `/goal_pose|${nextGoal.x.toFixed(3)}|${nextGoal.y.toFixed(3)}|${nextGoal.yaw.toFixed(3)}`;
+      setGoalPose(nextGoal);
+      if (goalKey !== lastGoalLogRef.current) {
+        lastGoalLogRef.current = goalKey;
+        addLog("info", `⬅️ /goal_pose alındı: x=${nextGoal.x.toFixed(2)}, y=${nextGoal.y.toFixed(2)}, yaw=${rad2deg(nextGoal.yaw)}°`);
+      }
+    });
     goalSubRef.current = topic;
     return () => { try { topic.unsubscribe(); } catch {} };
-  }, [ros, isConnected]);
+  }, [ros, isConnected, addLog]);
 
   // ── /goal_pose_task (Task Manager plugin'in yayınladığı hedef) ─────────────
   useEffect(() => {
     if (!ros || !isConnected) return;
     if (goalTaskSubRef.current) { try { goalTaskSubRef.current.unsubscribe(); } catch {} }
     const topic = new ROSLIB.Topic({ ros, name: "/goal_pose_task", messageType: "geometry_msgs/msg/PoseStamped", throttle_rate: 200, queue_length: 1 });
-    topic.subscribe((msg) => { const p = msg.pose; setGoalPose({ x: p.position.x, y: p.position.y, yaw: quatToYaw(p.orientation) }); });
+    topic.subscribe((msg) => {
+      const p = msg.pose;
+      const nextGoal = { x: p.position.x, y: p.position.y, yaw: quatToYaw(p.orientation) };
+      const goalKey = `/goal_pose_task|${nextGoal.x.toFixed(3)}|${nextGoal.y.toFixed(3)}|${nextGoal.yaw.toFixed(3)}`;
+      setGoalPose(nextGoal);
+      pendingCommandRef.current = null;
+      if (goalKey !== lastGoalLogRef.current) {
+        lastGoalLogRef.current = goalKey;
+        addLog("info", `⬅️ /goal_pose_task alındı: x=${nextGoal.x.toFixed(2)}, y=${nextGoal.y.toFixed(2)}, yaw=${rad2deg(nextGoal.yaw)}°`);
+      }
+    });
     goalTaskSubRef.current = topic;
+    return () => { try { topic.unsubscribe(); } catch {} };
+  }, [ros, isConnected, addLog]);
+
+  // ── /gps_waypoint_nav/goal_pose (GPS waypoint bridge hedefi) ──────────────
+  useEffect(() => {
+    if (!ros || !isConnected) return;
+    if (gpsGoalSubRef.current) { try { gpsGoalSubRef.current.unsubscribe(); } catch {} }
+    const topic = new ROSLIB.Topic({ ros, name: "/gps_waypoint_nav/goal_pose", messageType: "geometry_msgs/msg/PoseStamped", throttle_rate: 200, queue_length: 1 });
+    topic.subscribe((msg) => {
+      const p = msg.pose;
+      const nextGoal = { x: p.position.x, y: p.position.y, yaw: quatToYaw(p.orientation) };
+      const goalKey = `/gps_waypoint_nav/goal_pose|${nextGoal.x.toFixed(3)}|${nextGoal.y.toFixed(3)}|${nextGoal.yaw.toFixed(3)}`;
+      setGoalPose(nextGoal);
+      if (goalKey !== lastGoalLogRef.current) {
+        lastGoalLogRef.current = goalKey;
+        addLog("info", `⬅️ /gps_waypoint_nav/goal_pose alındı: x=${nextGoal.x.toFixed(2)}, y=${nextGoal.y.toFixed(2)}, yaw=${rad2deg(nextGoal.yaw)}°`);
+      }
+    });
+    gpsGoalSubRef.current = topic;
+    return () => { try { topic.unsubscribe(); } catch {} };
+  }, [ros, isConnected, addLog]);
+
+  // ── /gps_waypoint_nav/status ───────────────────────────────────────────────
+  useEffect(() => {
+    if (!ros || !isConnected) return;
+    if (gpsStatusSubRef.current) { try { gpsStatusSubRef.current.unsubscribe(); } catch {} }
+    const topic = new ROSLIB.Topic({ ros, name: "/gps_waypoint_nav/status", messageType: "std_msgs/msg/String", throttle_rate: 200, queue_length: 10 });
+    topic.subscribe((msg) => {
+      const text = String(msg?.data || "");
+      if (/(complete|error|rejected|stopped|cancel)/i.test(text)) {
+        directGpsTaskRef.current = false;
+      }
+    });
+    gpsStatusSubRef.current = topic;
     return () => { try { topic.unsubscribe(); } catch {} };
   }, [ros, isConnected]);
 
@@ -195,10 +407,24 @@ export default function TaskManagerPage() {
     if (!ros || !isConnected) return;
     if (stateSubRef.current) { try { stateSubRef.current.unsubscribe(); } catch {} }
     const topic = new ROSLIB.Topic({ ros, name: "/task_manager/state", messageType: "std_msgs/msg/String", throttle_rate: 500, queue_length: 1 });
-    topic.subscribe((msg) => { try { const j = JSON.parse(msg.data); setTaskState({ name: j.active_task?.name || "", state: j.active_task?.state || "IDLE", observers: j.active_observers || [] }); } catch {} });
+    topic.subscribe((msg) => {
+      try {
+        const j = JSON.parse(msg.data);
+        const nextState = { name: j.active_task?.name || "", state: j.active_task?.state || "IDLE", observers: j.active_observers || [] };
+        const stateKey = `${nextState.name}|${nextState.state}|${nextState.observers.join(",")}`;
+        setTaskState(nextState);
+        if (stateKey !== lastStateLogRef.current) {
+          lastStateLogRef.current = stateKey;
+          addLog("info", `⬅️ /task_manager/state: ${nextState.name || "-"} → ${nextState.state}`);
+        }
+        if (nextState.name || nextState.state?.toUpperCase() !== "IDLE") pendingCommandRef.current = null;
+      } catch (err) {
+        addLog("error", `/task_manager/state JSON okunamadı: ${prettyErr(err)}`);
+      }
+    });
     stateSubRef.current = topic;
     return () => { try { topic.unsubscribe(); } catch {} };
-  }, [ros, isConnected]);
+  }, [ros, isConnected, addLog]);
 
   // ── /task_manager/status (2 JSON format desteği) ───────────────────────────
   useEffect(() => {
@@ -209,18 +435,30 @@ export default function TaskManagerPage() {
       try {
         const j = JSON.parse(msg.data);
         // Format 1: emit_status → {level, message}
-        if (j.message !== undefined) { if (!j.message.includes("heartbeat")) addLog((j.level || "info").toLowerCase(), j.message); return; }
+        if (j.message !== undefined) {
+          if (!j.message.includes("heartbeat")) {
+            pendingCommandRef.current = null;
+            addLog((j.level || "info").toLowerCase(), `⬅️ /task_manager/status: ${j.message}`);
+          }
+          return;
+        }
         // Format 2: StatusPublisher → {level, type, payload}
         if (j.type !== undefined && j.payload !== undefined) {
           const level = (j.level || "info").toLowerCase();
           if (["tasks", "observers", "packs"].includes(j.type)) {
-            try { const data = typeof j.payload === "string" ? JSON.parse(j.payload) : j.payload; addLog(level, `${j.type}: [${(data[j.type] || []).join(", ")}]`); } catch { addLog(level, `${j.type}: ${JSON.stringify(j.payload)}`); }
+            pendingCommandRef.current = null;
+            try { const data = typeof j.payload === "string" ? JSON.parse(j.payload) : j.payload; addLog(level, `⬅️ ${j.type}: [${(data[j.type] || []).join(", ")}]`); } catch { addLog(level, `⬅️ ${j.type}: ${JSON.stringify(j.payload)}`); }
             return;
           }
           const ps = typeof j.payload === "string" ? j.payload : JSON.stringify(j.payload);
-          if (!ps.includes("heartbeat")) addLog(level, ps);
+          if (!ps.includes("heartbeat")) {
+            pendingCommandRef.current = null;
+            addLog(level, `⬅️ /task_manager/status: ${ps}`);
+          }
         }
-      } catch {}
+      } catch (err) {
+        addLog("error", `/task_manager/status JSON okunamadı: ${prettyErr(err)}`);
+      }
     });
     statusSubRef.current = topic;
     return () => { try { topic.unsubscribe(); } catch {} };
@@ -266,13 +504,99 @@ export default function TaskManagerPage() {
 
   const sendRunCmd = useCallback((cmdStr) => {
     if (!ros || !isConnected) { addLog("error", "ROS bağlı değil!"); return; }
-    try {
-      const topic = new ROSLIB.Topic({ ros, name: "/task_manager/run_cmd", messageType: "std_msgs/msg/String", queue_size: 1 });
-      topic.publish({ data: cmdStr });
-      addLog("info", `📤 Komut: ${cmdStr}`);
-      setTimeout(() => { try { topic.unadvertise(); } catch {} }, 500);
-    } catch (err) { addLog("error", `Gönderim hatası: ${prettyErr(err)}`); }
-  }, [ros, isConnected, addLog]);
+    const isRunCommand = /^run\s+/i.test(cmdStr.trim());
+    const publishCommand = () => {
+      try {
+        const topic = new ROSLIB.Topic({ ros, name: "/task_manager/run_cmd", messageType: "std_msgs/msg/String", queue_size: 1 });
+        topic.advertise();
+        topic.publish({ data: cmdStr });
+        pendingCommandRef.current = { cmd: cmdStr, sentAt: Date.now() };
+        addLog("info", `📤 /task_manager/run_cmd gönderildi: ${cmdStr}`);
+        setTimeout(() => { try { topic.unadvertise(); } catch {} }, 800);
+        setTimeout(() => {
+          const pending = pendingCommandRef.current;
+          if (pending?.cmd === cmdStr && Date.now() - pending.sentAt >= 2200) {
+            addLog("warn", `ROS publish çağrısı yapıldı ama Task Manager'dan henüz state/status/goal geri gelmedi: ${cmdStr}`);
+          }
+        }, 2400);
+      } catch (err) {
+        addLog("error", `Gönderim hatası: ${prettyErr(err)}`);
+      }
+    };
+
+    if (isRunCommand && operationMode !== "task") {
+      setOperationMode("task");
+      addLog("info", `📤 /mod gönderildi: task (görev komutundan önce)`);
+      setTimeout(publishCommand, 120);
+      return;
+    }
+
+    publishCommand();
+  }, [ros, isConnected, addLog, operationMode, setOperationMode]);
+
+  const ensureGpsWaypointPublisher = useCallback(() => {
+    if (gpsWaypointPubRef.current) return gpsWaypointPubRef.current;
+    if (!ros) return null;
+
+    const topic = new ROSLIB.Topic({
+      ros,
+      name: "/ui/gps_waypoint",
+      messageType: "std_msgs/String",
+      queue_size: 1,
+    });
+
+    topic.advertise();
+    gpsWaypointPubRef.current = topic;
+    return topic;
+  }, [ros]);
+
+  const publishGpsWaypoint = useCallback((payload, label) => {
+    const topic = ensureGpsWaypointPublisher();
+    if (!topic) {
+      addLog("error", "GPS waypoint publisher hazır değil!");
+      return false;
+    }
+
+    const missionWaypointPayload = {
+      latitude: Number(payload?.latitude ?? payload?.lat),
+      longitude: Number(payload?.longitude ?? payload?.lon ?? payload?.lng),
+    };
+
+    if (!Number.isFinite(missionWaypointPayload.latitude) || !Number.isFinite(missionWaypointPayload.longitude)) {
+      addLog("error", "GPS waypoint payload geçersiz!");
+      return false;
+    }
+
+    if (Number.isFinite(Number(payload?.altitude ?? payload?.alt))) {
+      missionWaypointPayload.altitude = Number(payload.altitude ?? payload.alt);
+    }
+
+    const waitSeconds = waypointWaitSecondsValue(payload?.wait_seconds ?? payload?.waitSeconds);
+    if (waitSeconds) {
+      missionWaypointPayload.wait_seconds = waitSeconds;
+    }
+
+    const speedMultiplier = waypointSpeedValue(payload?.speed_multiplier ?? payload?.speedMultiplier ?? payload?.speed);
+    if (Number.isFinite(speedMultiplier) && speedMultiplier !== 1.0) {
+      missionWaypointPayload.speed_multiplier = speedMultiplier;
+      missionWaypointPayload.speed = speedMultiplier;
+    }
+
+    topic.publish({ data: JSON.stringify(missionWaypointPayload) });
+    directGpsTaskRef.current = true;
+    addLog("info", `📤 /ui/gps_waypoint gönderildi: ${label} (${missionWaypointPayload.latitude.toFixed(7)}, ${missionWaypointPayload.longitude.toFixed(7)})`);
+    return true;
+  }, [ensureGpsWaypointPublisher, addLog]);
+
+  const cancelDirectGpsWaypoint = useCallback(() => {
+    const topic = ensureGpsWaypointPublisher();
+    if (!topic) return false;
+
+    topic.publish({ data: JSON.stringify({ command: "cancel" }) });
+    directGpsTaskRef.current = false;
+    addLog("warn", "🛑 /ui/gps_waypoint cancel gönderildi");
+    return true;
+  }, [ensureGpsWaypointPublisher, addLog]);
 
   // Direkt Nav2 — CoveragePage 2D Nav Goal tarzı (task manager bypass)
   const sendDirectNav2Goal = useCallback((x, y, yawRad) => {
@@ -300,9 +624,14 @@ export default function TaskManagerPage() {
   // ══════════════════════════════════════════════════════════════════════════
 
   const handleStop = useCallback(() => {
-    if (taskState.name) sendRunCmd(`stop ${taskState.name}`);
+    if (directGpsTaskRef.current) {
+      cancelDirectGpsWaypoint();
+      setActiveTaskLabel("");
+      return;
+    }
+    if (taskState.name) { sendRunCmd(`stop ${taskState.name}`); setActiveTaskLabel(""); }
     else addLog("warn", "Durdurulacak aktif görev yok!");
-  }, [taskState.name, sendRunCmd, addLog]);
+  }, [taskState.name, sendRunCmd, addLog, cancelDirectGpsWaypoint]);
 
   // FIX: Mesafe görevi artık Task Manager üzerinden → GoPose plugin Nav2'ye iletir
   const handleDistanceTask = useCallback((distStr) => {
@@ -338,17 +667,189 @@ export default function TaskManagerPage() {
     setCustomCmd("");
   }, [customCmd, sendRunCmd]);
 
+  // ── GPS Görevleri sekmesi: kullanıcı tanımlı görev ekle/sil/çalıştır ────────
+  const handleAddLocation = useCallback(() => {
+    const name = newLocName.trim();
+    if (!name) { addLog("error", "Görev adı girin!"); return; }
+    if (newLocMode === "gps") {
+      const lat = parseFloat(newLocLat), lon = parseFloat(newLocLon);
+      if (isNaN(lat) || isNaN(lon)) { addLog("error", "Geçerli Lat ve Lon girin!"); return; }
+      if (lat < -90 || lat > 90 || lon < -180 || lon > 180) { addLog("error", "Lat/Lon aralık dışı!"); return; }
+      const yaw = optionalNumber(newLocYaw);
+      if (hasText(newLocYaw) && yaw === null) { addLog("error", "Yaw boş bırakılabilir veya sayı olmalı."); return; }
+      const nextLocation = { id: Date.now(), name, mode: "gps", lat, lon };
+      if (yaw !== null && yaw !== 0) nextLocation.yaw = yaw;
+      setCustomLocations((prev) => [...prev, nextLocation]);
+      addLog("info", `📍 Yeni GPS görevi eklendi: ${name} (${lat.toFixed(6)}, ${lon.toFixed(6)})`);
+    } else {
+      const x = parseFloat(newLocX), y = parseFloat(newLocY);
+      const yaw = (parseFloat(newLocYaw) || 0) * (Math.PI / 180);
+      if (isNaN(x) || isNaN(y)) { addLog("error", "Geçerli X ve Y girin!"); return; }
+      setCustomLocations((prev) => [...prev, { id: Date.now(), name, mode: "xy", x, y, yaw }]);
+      addLog("info", `📍 Yeni görev eklendi: ${name} (${x.toFixed(2)}, ${y.toFixed(2)})`);
+    }
+    setNewLocName(""); setNewLocX(""); setNewLocY(""); setNewLocLat(""); setNewLocLon(""); setNewLocYaw(newLocMode === "gps" ? "" : "0");
+  }, [newLocName, newLocMode, newLocX, newLocY, newLocLat, newLocLon, newLocYaw, addLog]);
+
+  const handleRemoveLocation = useCallback((id) => {
+    setCustomLocations((prev) => prev.filter((l) => l.id !== id));
+  }, []);
+
+  const handleGoToLocation = useCallback((loc) => {
+    if (loc.mode === "gps") {
+      publishGpsWaypoint({ latitude: loc.lat, longitude: loc.lon }, loc.name);
+    } else {
+      sendRunCmd(`run GoPose {"x":${loc.x.toFixed(4)},"y":${loc.y.toFixed(4)},"yaw":${loc.yaw.toFixed(4)},"mode":"map"}`);
+    }
+    setActiveTaskLabel(loc.name);
+  }, [sendRunCmd, publishGpsWaypoint]);
+
+  const handleOpenSavedRoute = useCallback((route) => {
+    if (!route?.id) return;
+    queueGpsMissionRouteOpen(route.id);
+    addLog("info", `🗺 GPS rota GPS Mission sayfasında açılıyor: ${route.name}`);
+    navigate("/gps-mission");
+  }, [addLog, navigate]);
+
+  const handleDeleteSavedRoute = useCallback((route) => {
+    if (!route?.id) return;
+    deleteSavedGpsMissionRoute(route.id);
+    setSavedRoutes(readSavedGpsMissionRoutes());
+    addLog("info", `🗑 Kayıtlı rota silindi: ${route.name}`);
+  }, [addLog]);
+
+  const handleGoHome = useCallback(() => {
+    const lat = Number(homeGps.lat), lon = Number(homeGps.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      addLog("error", "Eve Dön hedefi geçersiz: lat/lon sayı olmalı.");
+      return;
+    }
+    publishGpsWaypoint({ latitude: lat, longitude: lon }, "Eve Dön");
+    setActiveTaskLabel("Eve Dön");
+  }, [homeGps, addLog, publishGpsWaypoint]);
+  const handleGoCharge = useCallback(() => {
+    const lat = Number(chargeGps.lat), lon = Number(chargeGps.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      addLog("error", "Şarja Git hedefi geçersiz: lat/lon sayı olmalı.");
+      return;
+    }
+    publishGpsWaypoint({ latitude: lat, longitude: lon }, "Şarja Git");
+    setActiveTaskLabel("Şarja Git");
+  }, [chargeGps, addLog, publishGpsWaypoint]);
+
+  const handleQueueReadyTask = useCallback((task) => {
+    const lat = Number(task?.lat);
+    const lon = Number(task?.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      addLog("error", `${task?.name || "Hazır görev"} için geçerli GPS koordinatı yok.`);
+      return;
+    }
+
+    const queuedItem = {
+      id: `ready-task-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      sourceId: String(task?.id || task?.name || ""),
+      name: String(task?.name || "Hazır görev"),
+      lat,
+      lon
+    };
+
+    setReadyTaskQueue(prev => [...prev, queuedItem]);
+    addLog("info", `🧾 Sıraya eklendi: ${queuedItem.name}`);
+  }, [addLog]);
+
+  const handleRemoveQueuedReadyTask = useCallback((itemId) => {
+    setReadyTaskQueue(prev => prev.filter(item => item.id !== itemId));
+  }, []);
+
+  const handleMoveQueuedReadyTask = useCallback((itemId, direction) => {
+    setReadyTaskQueue(prev => {
+      const index = prev.findIndex(item => item.id === itemId);
+      if (index < 0) return prev;
+      const targetIndex = direction === "up" ? index - 1 : index + 1;
+      if (targetIndex < 0 || targetIndex >= prev.length) return prev;
+      const next = [...prev];
+      const [item] = next.splice(index, 1);
+      next.splice(targetIndex, 0, item);
+      return next;
+    });
+  }, []);
+
+  const handleClearReadyTaskQueue = useCallback(() => {
+    setReadyTaskQueue([]);
+    addLog("info", "🗑 Hazır görev sırası temizlendi");
+  }, [addLog]);
+
+  const handleOpenReadyTaskQueueInGpsMission = useCallback(() => {
+    if (readyTaskQueue.length === 0) {
+      addLog("warn", "Önce sıraya en az bir hazır görev ekleyin.");
+      return;
+    }
+
+    const routeName = readyTaskQueue.length === 1
+      ? `Hazır görev: ${readyTaskQueue[0].name}`
+      : `Hazır görev sırası (${readyTaskQueue.length} nokta)`;
+
+    const route = {
+      id: `task-manager-ready-queue-${Date.now()}`,
+      name: routeName,
+      description: readyTaskQueue.map((item, index) => `${index + 1}. ${item.name}`).join(" → "),
+      waypoints: readyTaskQueue.map(item => ({
+        lat: item.lat,
+        lng: item.lon,
+        speed: "1.00",
+        mode: "pass"
+      })),
+      previewImage: createGpsRoutePreviewImage(
+        readyTaskQueue.map(item => ({ lat: item.lat, lng: item.lon })),
+        routeName
+      ),
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    queueGpsMissionDraftRouteOpen(route);
+    addLog("info", `🗺 Hazır görev sırası GPS Mission sayfasına açılıyor: ${routeName}`);
+    navigate("/gps-mission");
+  }, [addLog, navigate, readyTaskQueue]);
+
   // ── Color helpers ──────────────────────────────────────────────────────────
-  const stateColor = (s) => { switch ((s || "").toUpperCase()) { case "RUNNING": return "#3b82f6"; case "IDLE": return "#475569"; case "DONE": case "SUCCESS": return "#10b981"; case "ERROR": case "FAILED": return "#ef4444"; default: return "#f59e0b"; } };
+  // Gerçek plugin durumları: CONFIGURED, RUNNING, SUCCEEDED, FAILED, STOPPED (bkz. go_pose/go_home/go_charge .cpp)
+  const stateColor = (s) => { switch ((s || "").toUpperCase()) { case "RUNNING": return "#3b82f6"; case "IDLE": return "#475569"; case "DONE": case "SUCCESS": case "SUCCEEDED": return "#10b981"; case "ERROR": case "FAILED": return "#ef4444"; case "STOPPED": return "#f59e0b"; default: return "#f59e0b"; } };
+  const stateLabelTR = (s) => { switch ((s || "").toUpperCase()) { case "RUNNING": return "DEVAM EDİYOR"; case "DONE": case "SUCCESS": case "SUCCEEDED": return "TAMAMLANDI"; case "STOPPED": return "İPTAL EDİLDİ"; case "ERROR": case "FAILED": return "BAŞARISIZ"; case "CONFIGURED": return "BAŞLATILIYOR"; case "IDLE": default: return "BEKLEMEDE"; } };
   const logColor = (t) => { switch (t) { case "error": return "#f87171"; case "warn": return "#fbbf24"; case "info": return "#60a5fa"; default: return "#94a3b8"; } };
   const recoveryColor = recoveryActive ? "#ef4444" : "#10b981";
   const currentMode = operationMode || "manual";
+  const renderLogPanel = (title = "📝 DURUM KAYITLARI") => (
+    <div style={{ ...cardS, flex: 1, display: "flex", flexDirection: "column", minHeight: 0, overflow: "hidden" }}>
+      <div style={{ ...lblS, display: "flex", justifyContent: "space-between" }}>
+        <span>{title}</span>
+        <button
+          onClick={() => {
+            setLogs([]);
+            try { localStorage.removeItem(TASK_LOG_STORAGE_KEY); } catch {}
+          }}
+          style={{ ...btnS("transparent", "none"), padding: "0.1rem 0.3rem", fontSize: "0.5rem", color: "#334155" }}
+        >
+          Temizle
+        </button>
+      </div>
+      <div style={{ flex: 1, overflow: "auto", fontSize: "0.6rem", lineHeight: "1.7" }}>
+        {logs.length === 0 && <div style={{ color: "#1e293b", padding: "1rem", textAlign: "center" }}>Henüz kayıt yok…</div>}
+        {logs.map((l) => (
+          <div key={l.id} style={{ color: logColor(l.type) }}>
+            <span style={{ color: "#334155" }}>[{l.time}]</span> {l.msg}
+          </div>
+        ))}
+        <div ref={logEndRef} />
+      </div>
+    </div>
+  );
 
   // ══════════════════════════════════════════════════════════════════════════
   // RENDER
   // ══════════════════════════════════════════════════════════════════════════
   return (
-    <div style={{ height: "calc(100vh - 56px)", width: "100vw", background: "#060d1a", color: "white", padding: "0.5rem", fontFamily: "'JetBrains Mono','Fira Code','Segoe UI',monospace", overflow: "hidden", boxSizing: "border-box", display: "flex", flexDirection: "column", gap: "0.4rem" }}>
+    <div className="page-root" style={{ height: "calc(100vh - 56px)", width: "100%", background: "#060d1a", color: "white", padding: "0.5rem", fontFamily: "'JetBrains Mono','Fira Code','Segoe UI',monospace", overflow: "hidden", boxSizing: "border-box", display: "flex", flexDirection: "column", gap: "0.4rem" }}>
 
       {/* HEADER */}
       <div style={{ flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
@@ -372,8 +873,18 @@ export default function TaskManagerPage() {
         </div>
       </div>
 
-      {/* MAIN GRID */}
-      <div style={{ flex: 1, display: "grid", gridTemplateColumns: "280px 1fr 280px", gap: "0.4rem", minHeight: 0 }}>
+      {/* TABS */}
+      <div style={{ flexShrink: 0, display: "flex", gap: "0.3rem" }}>
+        {[["genel", "📋", "Genel"], ["gps", "📍", "GPS Görevleri"]].map(([key, icon, label]) => (
+          <button key={key} onClick={() => setActiveTab(key)} style={{ padding: "0.45rem 1rem", background: activeTab === key ? "#1d4ed8" : "#0d1829", border: `1px solid ${activeTab === key ? "#3b82f6" : "#162032"}`, borderBottom: activeTab === key ? "1px solid #1d4ed8" : "1px solid #162032", borderRadius: "0.4rem 0.4rem 0 0", color: activeTab === key ? "white" : "#64748b", cursor: "pointer", fontSize: "0.7rem", fontWeight: "700", fontFamily: "inherit", display: "flex", alignItems: "center", gap: "0.4rem" }}>
+            <span>{icon}</span><span>{label}</span>
+          </button>
+        ))}
+      </div>
+
+      {/* GENEL TAB — Nav2 / Mesafe / Manuel hedef / Loglar */}
+      {activeTab === "genel" && (
+      <div className="grid-collapse" style={{ flex: 1, display: "grid", gridTemplateColumns: "280px 1fr 280px", gap: "0.4rem", minHeight: 0 }}>
 
         {/* LEFT */}
         <div style={{ display: "flex", flexDirection: "column", gap: "0.4rem", overflow: "auto" }}>
@@ -395,7 +906,7 @@ export default function TaskManagerPage() {
             <div style={lblS}>AKTİF GÖREV</div>
             <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.3rem" }}>
               <div style={{ width: "10px", height: "10px", borderRadius: "50%", background: stateColor(taskState.state), boxShadow: `0 0 8px ${stateColor(taskState.state)}` }} />
-              <span style={{ ...valS, color: stateColor(taskState.state) }}>{taskState.state || "IDLE"}</span>
+              <span style={{ ...valS, color: stateColor(taskState.state) }}>{stateLabelTR(taskState.state)}</span>
             </div>
             {taskState.name && <div style={{ fontSize: "0.7rem", color: "#94a3b8" }}>Görev: <span style={{ color: "#e2e8f0", fontWeight: "700" }}>{taskState.name}</span></div>}
             {taskState.observers.length > 0 && <div style={{ fontSize: "0.55rem", color: "#334155" }}>Observers: {taskState.observers.join(", ")}</div>}
@@ -410,17 +921,15 @@ export default function TaskManagerPage() {
               <span style={{ fontSize: "0.55rem", color: "#475569" }}>m</span>
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: "0.25rem" }}>
-              {[
-                { label: `${taskDistance || "?"}m İleri`, icon: "🚀", action: () => handleDistanceTask(taskDistance) },
-                { label: "50m İleri",  icon: "📏", action: () => handleDistanceTask("50") },
-                { label: "10m İleri",  icon: "📐", action: () => handleDistanceTask("10") },
-                { label: "Eve Dön",    icon: "🏠", action: () => sendRunCmd("run GoHome") },
-                { label: "Şarj Git",   icon: "🔋", action: () => sendRunCmd("run GoCharge {}") },
-              ].map((t, i) => (
-                <button key={i} onClick={t.action} disabled={!isConnected} style={{ ...btnS("#162032"), padding: "0.5rem 0.6rem", textAlign: "left", display: "flex", alignItems: "center", gap: "0.4rem", opacity: isConnected ? 1 : 0.4, fontSize: "0.68rem" }}>
-                  <span style={{ fontSize: "0.9rem" }}>{t.icon}</span><span>{t.label}</span>
-                </button>
-              ))}
+              <button onClick={() => handleDistanceTask(taskDistance)} disabled={!isConnected} style={{ ...btnS("#162032"), padding: "0.5rem 0.6rem", textAlign: "left", display: "flex", alignItems: "center", gap: "0.4rem", opacity: isConnected ? 1 : 0.4, fontSize: "0.68rem" }}>
+                <span style={{ fontSize: "0.9rem" }}>🚀</span><span>{taskDistance || "?"}m İleri</span>
+              </button>
+              <button onClick={() => handleDistanceTask("50")} disabled={!isConnected} style={{ ...btnS("#162032"), padding: "0.5rem 0.6rem", textAlign: "left", display: "flex", alignItems: "center", gap: "0.4rem", opacity: isConnected ? 1 : 0.4, fontSize: "0.68rem" }}>
+                <span style={{ fontSize: "0.9rem" }}>📏</span><span>50m İleri</span>
+              </button>
+              <button onClick={() => handleDistanceTask("10")} disabled={!isConnected} style={{ ...btnS("#162032"), padding: "0.5rem 0.6rem", textAlign: "left", display: "flex", alignItems: "center", gap: "0.4rem", opacity: isConnected ? 1 : 0.4, fontSize: "0.68rem" }}>
+                <span style={{ fontSize: "0.9rem" }}>📐</span><span>10m İleri</span>
+              </button>
               <button onClick={handleStop} disabled={!isConnected} style={{ ...btnS("#7f1d1d"), padding: "0.5rem 0.6rem", textAlign: "left", display: "flex", alignItems: "center", gap: "0.4rem", opacity: isConnected ? 1 : 0.4, fontSize: "0.68rem" }}>
                 <span style={{ fontSize: "0.9rem" }}>⏹</span><span>Dur{taskState.name ? ` (${taskState.name})` : ""}</span>
               </button>
@@ -525,17 +1034,7 @@ export default function TaskManagerPage() {
           </div>
 
           {/* Logs */}
-          <div style={{ ...cardS, flex: 1, display: "flex", flexDirection: "column", minHeight: 0, overflow: "hidden" }}>
-            <div style={{ ...lblS, display: "flex", justifyContent: "space-between" }}>
-              <span>📝 DURUM KAYITLARI</span>
-              <button onClick={() => setLogs([])} style={{ ...btnS("transparent", "none"), padding: "0.1rem 0.3rem", fontSize: "0.5rem", color: "#334155" }}>Temizle</button>
-            </div>
-            <div style={{ flex: 1, overflow: "auto", fontSize: "0.6rem", lineHeight: "1.7" }}>
-              {logs.length === 0 && <div style={{ color: "#1e293b", padding: "1rem", textAlign: "center" }}>Henüz kayıt yok…</div>}
-              {logs.map((l) => <div key={l.id} style={{ color: logColor(l.type) }}><span style={{ color: "#334155" }}>[{l.time}]</span> {l.msg}</div>)}
-              <div ref={logEndRef} />
-            </div>
-          </div>
+          {renderLogPanel()}
         </div>
 
         {/* RIGHT */}
@@ -621,6 +1120,322 @@ export default function TaskManagerPage() {
           </div>
         </div>
       </div>
+      )}
+
+      {/* GPS TAB — Sabit konumlar (Eve Dön / Şarja Git) + kullanıcı tanımlı görevler */}
+      {activeTab === "gps" && (
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: "0.4rem", minHeight: 0 }}>
+
+        {/* DURUM ÇUBUĞU: aktif görev / durum / durdur + araç konumu + görev noktası + kalan mesafe */}
+        <div style={{ display: "grid", gridTemplateColumns: "1.2fr 1fr 1fr 0.9fr", gap: "0.4rem", flexShrink: 0 }}>
+          <div style={{ ...cardS, borderColor: `${stateColor(taskState.state)}55` }}>
+            <div style={lblS}>📡 GÖREV DURUMU</div>
+            <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.3rem" }}>
+              <div style={{ width: "10px", height: "10px", borderRadius: "50%", background: stateColor(taskState.state), boxShadow: `0 0 8px ${stateColor(taskState.state)}`, animation: taskState.state?.toUpperCase() === "RUNNING" ? "pulse 1.5s infinite" : "none" }} />
+              <span style={{ ...valS, color: stateColor(taskState.state) }}>{stateLabelTR(taskState.state)}</span>
+            </div>
+            <div style={{ fontSize: "0.65rem", color: "#94a3b8", marginBottom: "0.4rem" }}>
+              {activeTaskLabel ? <>Görev: <span style={{ color: "#e2e8f0", fontWeight: "700" }}>{activeTaskLabel}</span></> : "Aktif görev yok"}
+            </div>
+            <button onClick={handleStop} disabled={!isConnected || !taskState.name} style={{ ...btnS("#7f1d1d"), width: "100%", opacity: (isConnected && taskState.name) ? 1 : 0.4 }}>⏹ Durdur / İptal Et</button>
+          </div>
+
+          <div style={{ ...cardS, borderColor: "#0f4c75" }}>
+            <div style={lblS}>🚗 ARAÇ KONUMU {poseSource && <span style={{ color: "#334155" }}>({poseSource})</span>}</div>
+            {robotPose ? (
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "0.4rem" }}>
+                {[["X", robotPose.x.toFixed(3)], ["Y", robotPose.y.toFixed(3)], ["YAW", `${rad2deg(robotPose.yaw)}°`]].map(([l, v]) => (
+                  <div key={l}><div style={{ fontSize: "0.5rem", color: "#475569" }}>{l}</div><div style={{ ...valS, color: "#38bdf8" }}>{v}</div></div>
+                ))}
+              </div>
+            ) : <div style={{ fontSize: "0.65rem", color: "#334155" }}>Veri bekleniyor…</div>}
+          </div>
+
+          <div style={{ ...cardS, borderColor: "#4c1d95" }}>
+            <div style={lblS}>📍 GÖREV NOKTASI</div>
+            {goalPose ? (
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "0.4rem" }}>
+                {[["X", goalPose.x.toFixed(3)], ["Y", goalPose.y.toFixed(3)], ["YAW", `${rad2deg(goalPose.yaw)}°`]].map(([l, v]) => (
+                  <div key={l}><div style={{ fontSize: "0.5rem", color: "#475569" }}>{l}</div><div style={{ ...valS, color: "#a78bfa" }}>{v}</div></div>
+                ))}
+              </div>
+            ) : <div style={{ fontSize: "0.65rem", color: "#334155" }}>Hedef belirlenmedi</div>}
+          </div>
+
+          <div style={{ ...cardS, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: "linear-gradient(135deg, #0d1829, #111d33)" }}>
+            <div style={{ fontSize: "0.5rem", color: "#475569" }}>KALAN MESAFE</div>
+            <div style={{ fontSize: "1.3rem", fontWeight: "900", color: "#fbbf24" }}>
+              {robotPose && goalPose ? Math.hypot(goalPose.x - robotPose.x, goalPose.y - robotPose.y).toFixed(2) : "—"}
+              <span style={{ fontSize: "0.55rem", color: "#78716c" }}> m</span>
+            </div>
+            {robotPose && goalPose && <div style={{ fontSize: "0.55rem", color: "#60a5fa", marginTop: "0.2rem" }}>↗ {rad2deg(Math.atan2(goalPose.y - robotPose.y, goalPose.x - robotPose.x))}°</div>}
+          </div>
+        </div>
+
+        {/* ALT: Sol kolon (sabit konumlar + yeni görev + log) | Sağ kolon (kayıtlı görevler) */}
+        <div style={{ flex: 1, display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.4rem", minHeight: 0 }}>
+          {/* LEFT: Sabit konumlar + yeni görev ekleme formu + log */}
+          <div style={{ display: "flex", flexDirection: "column", gap: "0.4rem", minHeight: 0, overflow: "hidden" }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: "0.4rem", overflow: "auto", paddingRight: "0.1rem" }}>
+            <div style={cardS}>
+              <div style={lblS}>📍 SABİT KONUMLAR (GPS · Task Manager)</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+                {/* EVE DÖN */}
+                <div style={{ background: "#0a1020", border: "1px solid #0f4c75", borderRadius: "0.35rem", padding: "0.4rem" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
+                    <button onClick={() => handleQueueReadyTask({ id: "home", name: "Eve Dön", lat: Number(homeGps.lat), lon: Number(homeGps.lon) })} disabled={!isConnected} style={{ ...btnS("#0f4c75"), flex: 1, padding: "0.5rem 0.6rem", display: "flex", alignItems: "center", gap: "0.5rem", opacity: isConnected ? 1 : 0.4, fontSize: "0.75rem" }}>
+                      <span style={{ fontSize: "1.1rem" }}>🏠</span><span>Sıraya Ekle: Eve Dön</span>
+                    </button>
+                    <button onClick={() => setEditHome((v) => !v)} style={{ ...btnS("transparent", "1px solid #1e3a5f"), fontSize: "0.6rem", color: "#60a5fa" }}>{editHome ? "✓ Kapat" : "✎ Düzenle"}</button>
+                  </div>
+                  {!editHome ? (
+                    <div style={{ fontSize: "0.58rem", color: "#64748b", marginTop: "0.35rem", fontFamily: "'JetBrains Mono',monospace" }}>
+                      Lat: <span style={{ color: "#38bdf8" }}>{Number(homeGps.lat).toFixed(7)}</span> · Lon: <span style={{ color: "#38bdf8" }}>{Number(homeGps.lon).toFixed(7)}</span> · Yaw: <span style={{ color: "#38bdf8" }}>{homeGps.yaw}</span>
+                    </div>
+                  ) : (
+                    <div style={{ display: "flex", gap: "0.3rem", marginTop: "0.35rem" }}>
+                      {[["LAT", "lat"], ["LON", "lon"], ["YAW", "yaw"]].map(([l, k]) => (
+                        <div key={k} style={{ flex: 1 }}>
+                          <div style={{ fontSize: "0.45rem", color: "#475569", marginBottom: "0.1rem" }}>{l}</div>
+                          <input value={homeGps[k]} onChange={(e) => setHomeGps((p) => ({ ...p, [k]: e.target.value }))} style={{ ...inputS, padding: "0.3rem", fontSize: "0.6rem" }} />
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                {/* ŞARJA GİT */}
+                <div style={{ background: "#0a1020", border: "1px solid #4c1d95", borderRadius: "0.35rem", padding: "0.4rem" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
+                    <button onClick={() => handleQueueReadyTask({ id: "charge", name: "Şarja Git", lat: Number(chargeGps.lat), lon: Number(chargeGps.lon) })} disabled={!isConnected} style={{ ...btnS("#4c1d95"), flex: 1, padding: "0.5rem 0.6rem", display: "flex", alignItems: "center", gap: "0.5rem", opacity: isConnected ? 1 : 0.4, fontSize: "0.75rem" }}>
+                      <span style={{ fontSize: "1.1rem" }}>🔋</span><span>Sıraya Ekle: Şarja Git</span>
+                    </button>
+                    <button onClick={() => setEditCharge((v) => !v)} style={{ ...btnS("transparent", "1px solid #4c1d95"), fontSize: "0.6rem", color: "#a78bfa" }}>{editCharge ? "✓ Kapat" : "✎ Düzenle"}</button>
+                  </div>
+                  {!editCharge ? (
+                    <div style={{ fontSize: "0.58rem", color: "#64748b", marginTop: "0.35rem", fontFamily: "'JetBrains Mono',monospace" }}>
+                      Lat: <span style={{ color: "#a78bfa" }}>{Number(chargeGps.lat).toFixed(7)}</span> · Lon: <span style={{ color: "#a78bfa" }}>{Number(chargeGps.lon).toFixed(7)}</span> · Yaw: <span style={{ color: "#a78bfa" }}>{chargeGps.yaw}</span>
+                    </div>
+                  ) : (
+                    <div style={{ display: "flex", gap: "0.3rem", marginTop: "0.35rem" }}>
+                      {[["LAT", "lat"], ["LON", "lon"], ["YAW", "yaw"]].map(([l, k]) => (
+                        <div key={k} style={{ flex: 1 }}>
+                          <div style={{ fontSize: "0.45rem", color: "#475569", marginBottom: "0.1rem" }}>{l}</div>
+                          <input value={chargeGps[k]} onChange={(e) => setChargeGps((p) => ({ ...p, [k]: e.target.value }))} style={{ ...inputS, padding: "0.3rem", fontSize: "0.6rem" }} />
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+              <div style={{ fontSize: "0.5rem", color: "#334155", marginTop: "0.5rem", lineHeight: "1.6" }}>
+                Eve Dön / Şarja Git, GoHome / GoCharge plugin'lerine lat/lon hedefi ile gönderilir. Buradaki değerler tarayıcıda saklanır; ✎ Düzenle ile değiştirebilirsiniz.
+              </div>
+            </div>
+
+            <div style={cardS}>
+              <div style={lblS}>🧾 HAZIR GÖREV SIRASI</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: "0.35rem" }}>
+                {readyTaskQueue.length === 0 ? (
+                  <div style={{ fontSize: "0.62rem", color: "#334155", padding: "0.4rem 0.1rem" }}>
+                    Eve Dön, Şarja Git veya Yatak görevlerine basınca burada sıra oluşur.
+                  </div>
+                ) : (
+                  readyTaskQueue.map((item, index) => (
+                    <div key={item.id} style={{ display: "flex", alignItems: "center", gap: "0.35rem", padding: "0.42rem 0.5rem", background: "#0a1020", border: "1px solid #1e293b", borderRadius: "0.35rem" }}>
+                      <div style={{ width: 22, height: 22, borderRadius: "999px", background: "#1d4ed8", color: "#dbeafe", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "0.58rem", fontWeight: 800 }}>
+                        {index + 1}
+                      </div>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: "0.66rem", color: "#e2e8f0", fontWeight: 700 }}>{item.name}</div>
+                        <div style={{ fontSize: "0.5rem", color: "#64748b" }}>
+                          Lat:{item.lat.toFixed(6)} Lon:{item.lon.toFixed(6)}
+                        </div>
+                      </div>
+                      <button onClick={() => handleMoveQueuedReadyTask(item.id, "up")} style={{ ...btnS("#162032"), fontSize: "0.58rem", padding: "0.28rem 0.42rem" }} disabled={index === 0}>▲</button>
+                      <button onClick={() => handleMoveQueuedReadyTask(item.id, "down")} style={{ ...btnS("#162032"), fontSize: "0.58rem", padding: "0.28rem 0.42rem" }} disabled={index === readyTaskQueue.length - 1}>▼</button>
+                      <button onClick={() => handleRemoveQueuedReadyTask(item.id)} style={{ ...btnS("#7f1d1d"), fontSize: "0.58rem", padding: "0.28rem 0.42rem" }}>✕</button>
+                    </div>
+                  ))
+                )}
+                <div style={{ display: "flex", gap: "0.35rem", marginTop: "0.15rem" }}>
+                  <button onClick={handleOpenReadyTaskQueueInGpsMission} disabled={!isConnected || readyTaskQueue.length === 0} style={{ ...btnS("#16a34a"), flex: 1, opacity: isConnected && readyTaskQueue.length > 0 ? 1 : 0.4, fontSize: "0.68rem" }}>
+                    ▶ Sıralı İşlem Başlat
+                  </button>
+                  <button onClick={handleClearReadyTaskQueue} disabled={readyTaskQueue.length === 0} style={{ ...btnS("#162032"), fontSize: "0.64rem", opacity: readyTaskQueue.length > 0 ? 1 : 0.4 }}>
+                    Temizle
+                  </button>
+                </div>
+                <div style={{ fontSize: "0.5rem", color: "#334155", lineHeight: "1.6" }}>
+                  Başlat dediğinde sıra GPS Mission sayfasında rota olarak açılır. Orada waypoint hızı ve hassas işlem süreleri düzenlenebilir.
+                </div>
+              </div>
+            </div>
+
+            <div style={cardS}>
+              <div style={lblS}>➕ YENİ GÖREV EKLE</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: "0.35rem" }}>
+                {/* MOD SEÇİMİ: XY (harita) veya Lat/Lon (GPS) */}
+                <div style={{ display: "flex", gap: "0.3rem" }}>
+                  {[["xy", "📐 X / Y (m)"], ["gps", "🛰 Lat / Lon"]].map(([key, label]) => (
+                    <button key={key} onClick={() => setNewLocMode(key)}
+                      style={{ ...pillS(newLocMode === key, key === "gps" ? "#10b981" : "#3b82f6"), padding: "0.4rem 0.5rem", fontSize: "0.62rem" }}>
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                <div>
+                  <div style={{ fontSize: "0.5rem", color: "#475569", marginBottom: "0.15rem" }}>GÖREV ADI</div>
+                  <input value={newLocName} onChange={(e) => setNewLocName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && handleAddLocation()} placeholder="örn. Ofise Git" style={inputS} />
+                </div>
+                {newLocMode === "gps" ? (
+                  <div style={{ display: "flex", gap: "0.3rem" }}>
+                    {[["LAT", newLocLat, setNewLocLat, "39.7961831"], ["LON", newLocLon, setNewLocLon, "32.5312344"], ["YAW", newLocYaw, setNewLocYaw, "opsiyonel"]].map(([l, v, s, ph]) => (
+                      <div key={l} style={{ flex: 1 }}>
+                        <div style={{ fontSize: "0.5rem", color: "#475569", marginBottom: "0.15rem" }}>{l}</div>
+                        <input value={v} onChange={(e) => s(e.target.value)} placeholder={ph} style={inputS} />
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", gap: "0.3rem" }}>
+                    {[["X (m)", newLocX, setNewLocX], ["Y (m)", newLocY, setNewLocY], ["YAW (°)", newLocYaw, setNewLocYaw]].map(([l, v, s]) => (
+                      <div key={l} style={{ flex: 1 }}>
+                        <div style={{ fontSize: "0.5rem", color: "#475569", marginBottom: "0.15rem" }}>{l}</div>
+                        <input value={v} onChange={(e) => s(e.target.value)} placeholder="0.0" style={inputS} />
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {robotPose && newLocMode === "xy" && (
+                  <button onClick={() => { setNewLocX(robotPose.x.toFixed(3)); setNewLocY(robotPose.y.toFixed(3)); setNewLocYaw(rad2deg(robotPose.yaw)); }}
+                    style={{ ...btnS("transparent", "1px solid #1e293b"), fontSize: "0.55rem", color: "#475569" }}>
+                    📋 Mevcut pozisyonu kopyala
+                  </button>
+                )}
+                <button onClick={handleAddLocation} style={{ ...btnS("#1d4ed8"), marginTop: "0.2rem", fontSize: "0.7rem" }}>＋ Görev Ekle</button>
+              </div>
+            </div>
+            </div>
+            <div style={{ minHeight: "190px", flex: "0 0 230px", display: "flex", minWidth: 0 }}>
+              {renderLogPanel("📝 ROS GÖNDERİM / GERİ BİLDİRİM LOGU")}
+            </div>
+          </div>
+
+          {/* RIGHT: Kayıtlı görevler */}
+          <div style={{ display: "flex", flexDirection: "column", gap: "0.4rem", minHeight: 0, overflow: "hidden" }}>
+            <div style={{ ...cardS, flex: 1, display: "flex", flexDirection: "column", minHeight: 0, overflow: "hidden" }}>
+              <div style={{ ...lblS, display: "flex", justifyContent: "space-between" }}>
+                <span>📋 KAYITLI GÖREVLER ({BED_LOCATIONS.length + customLocations.length})</span>
+              </div>
+              <div style={{ flex: 1, overflow: "auto", display: "flex", flexDirection: "column", gap: "0.3rem" }}>
+                <div style={{ fontSize: "0.52rem", color: "#475569", fontWeight: 800, letterSpacing: "0.08em", marginTop: 2 }}>
+                  HAZIR YATAK GÖREVLERİ
+                </div>
+                {BED_LOCATIONS.map((loc) => {
+                  const isActive = activeTaskLabel === loc.name && taskState.state?.toUpperCase() === "RUNNING";
+                  const previewImage = BED_PREVIEW_IMAGES[loc.id] || "";
+                  return (
+                    <div key={loc.id} style={{ display: "flex", alignItems: "center", gap: "0.4rem", padding: "0.5rem 0.6rem", background: isActive ? "rgba(16,185,129,0.12)" : "#071613", border: `1px solid ${isActive ? "#10b981" : "#064e3b"}`, borderRadius: "0.3rem" }}>
+                      <button
+                        type="button"
+                        onClick={() => setSelectedPreview({ name: loc.name, src: previewImage })}
+                        style={{ width: 66, flex: "0 0 66px", alignSelf: "stretch", borderRadius: "0.35rem", overflow: "hidden", border: `1px solid ${isActive ? "rgba(134,239,172,0.55)" : "rgba(110,231,183,0.24)"}`, background: "#03110d", display: "flex", alignItems: "center", justifyContent: "center", padding: 0, cursor: "pointer" }}
+                        title={`${loc.name} görselini büyüt`}
+                      >
+                        <img
+                          src={previewImage}
+                          alt={`${loc.name} önizleme`}
+                          style={{ display: "block", width: "100%", height: "100%", objectFit: "cover" }}
+                        />
+                      </button>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: "0.72rem", fontWeight: "800", color: isActive ? "#86efac" : "#d1fae5" }}>
+                          {isActive && "▶ "}{loc.name}
+                          <span style={{ fontSize: "0.45rem", fontWeight: "700", marginLeft: "0.35rem", padding: "0.05rem 0.25rem", borderRadius: "0.15rem", background: "#064e3b", color: "#6ee7b7" }}>GPS</span>
+                        </div>
+                        <div style={{ fontSize: "0.55rem", color: "#64748b" }}>
+                          Lat:{Number(loc.lat).toFixed(6)} Lon:{Number(loc.lon).toFixed(6)}
+                        </div>
+                      </div>
+                      <button onClick={() => handleQueueReadyTask(loc)} disabled={!isConnected} style={{ ...btnS("#065f46"), fontSize: "0.62rem", opacity: isConnected ? 1 : 0.4 }}>＋ Sıraya Ekle</button>
+                    </div>
+                  );
+                })}
+                <div style={{ fontSize: "0.52rem", color: "#475569", fontWeight: 800, letterSpacing: "0.08em", marginTop: 6 }}>
+                  KULLANICI GÖREVLERİ
+                </div>
+                {customLocations.length === 0
+                  ? <div style={{ fontSize: "0.6rem", color: "#1e293b", textAlign: "center", padding: "0.7rem" }}>Henüz özel görev eklenmedi.</div>
+                  : customLocations.map((loc) => {
+                    const isActive = activeTaskLabel === loc.name && taskState.state?.toUpperCase() === "RUNNING";
+                    return (
+                      <div key={loc.id} style={{ display: "flex", alignItems: "center", gap: "0.4rem", padding: "0.5rem 0.6rem", background: isActive ? "rgba(59,130,246,0.1)" : "#0a1020", border: `1px solid ${isActive ? "#3b82f6" : "#1e293b"}`, borderRadius: "0.3rem" }}>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: "0.72rem", fontWeight: "700", color: isActive ? "#93c5fd" : "#e2e8f0" }}>
+                            {isActive && "▶ "}{loc.name}
+                            <span style={{ fontSize: "0.45rem", fontWeight: "700", marginLeft: "0.35rem", padding: "0.05rem 0.25rem", borderRadius: "0.15rem", background: loc.mode === "gps" ? "#064e3b" : "#1e3a5f", color: loc.mode === "gps" ? "#6ee7b7" : "#93c5fd" }}>{loc.mode === "gps" ? "GPS" : "XY"}</span>
+                          </div>
+                          <div style={{ fontSize: "0.55rem", color: "#64748b" }}>
+                            {loc.mode === "gps"
+                              ? <>Lat:{Number(loc.lat).toFixed(6)} Lon:{Number(loc.lon).toFixed(6)} YAW:{optionalNumber(loc.yaw) ? loc.yaw : ""}</>
+                              : <>X:{loc.x.toFixed(2)} Y:{loc.y.toFixed(2)} YAW:{rad2deg(loc.yaw)}°</>}
+                          </div>
+                        </div>
+                        <button onClick={() => handleGoToLocation(loc)} disabled={!isConnected} style={{ ...btnS("#0f4c75"), fontSize: "0.62rem", opacity: isConnected ? 1 : 0.4 }}>▶ Git</button>
+                        <button onClick={() => handleRemoveLocation(loc.id)} style={{ ...btnS("#7f1d1d"), fontSize: "0.62rem" }}>🗑</button>
+                      </div>
+                    );
+                  })
+                }
+                <div style={{ fontSize: "0.52rem", color: "#475569", fontWeight: 800, letterSpacing: "0.08em", marginTop: 6 }}>
+                  KAYITLI ROTALAR ({savedRoutes.length})
+                </div>
+                {savedRoutes.length === 0 ? (
+                  <div style={{ fontSize: "0.6rem", color: "#1e293b", textAlign: "center", padding: "0.7rem" }}>
+                    GPS Mission tarafından kaydedilmiş rota yok.
+                  </div>
+                ) : (
+                  savedRoutes.map(route => (
+                    <SavedGpsRouteCard
+                      key={route.id}
+                      route={route}
+                      actionLabel="Bu Rotayı Yürüt"
+                      onAction={handleOpenSavedRoute}
+                      onDelete={handleDeleteSavedRoute}
+                      onPreview={(selectedRoute) => setSelectedPreview({ name: selectedRoute.name, src: selectedRoute.previewImage })}
+                    />
+                  ))
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      )}
+
+      {selectedPreview && (
+        <div
+          onClick={() => setSelectedPreview(null)}
+          style={{ position: "fixed", inset: 0, background: "rgba(2,6,23,0.82)", backdropFilter: "blur(4px)", display: "flex", alignItems: "center", justifyContent: "center", padding: "1.5rem", zIndex: 1000 }}
+        >
+          <div
+            onClick={(event) => event.stopPropagation()}
+            style={{ width: "min(92vw, 820px)", maxHeight: "88vh", background: "#08111f", border: "1px solid #1e3a5f", borderRadius: "1rem", overflow: "hidden", boxShadow: "0 24px 80px rgba(0,0,0,0.45)" }}
+          >
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0.9rem 1rem", borderBottom: "1px solid rgba(148,163,184,0.18)" }}>
+              <div style={{ color: "#e2e8f0", fontWeight: 800, fontSize: "0.95rem" }}>{selectedPreview.name}</div>
+              <button onClick={() => setSelectedPreview(null)} style={{ ...btnS("#162032", "1px solid #334155"), fontSize: "0.7rem" }}>Kapat</button>
+            </div>
+            <div style={{ padding: "1rem", background: "#020817" }}>
+              <img
+                src={selectedPreview.src}
+                alt={`${selectedPreview.name} büyük önizleme`}
+                style={{ display: "block", width: "100%", maxHeight: "72vh", objectFit: "contain", borderRadius: "0.75rem", border: "1px solid rgba(148,163,184,0.16)" }}
+              />
+            </div>
+          </div>
+        </div>
+      )}
 
       <style>{`
         @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.6} }

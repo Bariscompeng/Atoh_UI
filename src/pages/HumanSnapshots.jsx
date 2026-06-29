@@ -234,13 +234,13 @@ export default function HumanSnapshots() {
   return (
     <>
       <style>{CSS}</style>
-      <div style={{ height: "calc(100vh - 56px)", width: "100vw", background: "#030b17", color: "white", display: "flex", flexDirection: "column", overflow: "hidden", boxSizing: "border-box", fontFamily: "'Barlow Condensed',sans-serif", position: "relative" }}>
+      <div className="page-root" style={{ height: "calc(100vh - 56px)", width: "100%", background: "#030b17", color: "white", display: "flex", flexDirection: "column", overflow: "hidden", boxSizing: "border-box", fontFamily: "'Barlow Condensed',sans-serif", position: "relative" }}>
 
         {/* Scanline overlay */}
         <div style={{ position: "absolute", inset: 0, background: "repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,212,255,0.006) 3px,rgba(0,212,255,0.006) 4px)", pointerEvents: "none", zIndex: 0 }} />
 
         {/* ────── HEADER ────────────────────────────────────────────── */}
-        <header style={{ flexShrink: 0, padding: "0.45rem 0.85rem", borderBottom: "1px solid #071830", background: "#030b17", display: "flex", alignItems: "center", gap: "0.65rem", zIndex: 20, position: "relative" }}>
+        <header className="hs-header" style={{ flexShrink: 0, padding: "0.45rem 0.85rem", borderBottom: "1px solid #071830", background: "#030b17", display: "flex", alignItems: "center", gap: "0.65rem", zIndex: 20, position: "relative" }}>
 
           {/* Logo */}
           <div style={{ display: "flex", alignItems: "center", gap: "0.55rem" }}>
@@ -323,13 +323,13 @@ export default function HumanSnapshots() {
         </header>
 
         {/* ────── BODY ──────────────────────────────────────────────── */}
-        <div style={{ flex: 1, display: "flex", minHeight: 0, overflow: "hidden", position: "relative", zIndex: 1 }}>
+        <div className="stack-mobile" style={{ flex: 1, display: "flex", minHeight: 0, overflow: "hidden", position: "relative", zIndex: 1 }}>
 
           {/* Image + Log column */}
           <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0, overflow: "hidden" }}>
 
             {/* Camera feed */}
-            <div style={{ flex: "1 1 0", background: "#020810", overflow: "hidden", display: "flex", flexDirection: "column", minHeight: 0, borderBottom: "1px solid #071830", position: "relative" }}>
+            <div className="vp-fill" style={{ flex: "1 1 0", background: "#020810", overflow: "hidden", display: "flex", flexDirection: "column", minHeight: 0, borderBottom: "1px solid #071830", position: "relative" }}>
               {/* Corner brackets */}
               {[[{top:8,left:8},{borderTop:"1px solid #00d4ff2a",borderLeft:"1px solid #00d4ff2a"}],
                 [{top:8,right:8},{borderTop:"1px solid #00d4ff2a",borderRight:"1px solid #00d4ff2a"}],

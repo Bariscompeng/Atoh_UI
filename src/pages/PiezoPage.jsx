@@ -313,7 +313,7 @@ export default function PiezoPage() {
   };
 
   return (
-    <div style={s.page}>
+    <div className="page-root" style={s.page}>
       <div style={s.wrap}>
 
         {/* Header */}

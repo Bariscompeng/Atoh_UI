@@ -11,7 +11,10 @@ import * as ROSLIB from "roslib";
 
 const ROSContext = createContext(null);
 
-const DEFAULT_URL = `ws://${window.location.hostname || "localhost"}:9090`;
+// Sayfa HTTPS ile sunulursa tarayıcı düz ws:// bağlantısını engeller (mixed
+// content) → otomatik wss:// kullan. HTTP'de (LAN testi) ws:// kalır.
+const WS_PROTO = window.location.protocol === "https:" ? "wss" : "ws";
+const DEFAULT_URL = `${WS_PROTO}://${window.location.hostname || "localhost"}:9090`;
 
 function loadUrl() {
   return DEFAULT_URL;
